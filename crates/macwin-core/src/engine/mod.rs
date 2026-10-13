@@ -28,9 +28,10 @@ use crate::heartbeat::HeartbeatMonitor;
 use crate::keys::{ButtonSet, Pressed};
 use crate::layout::{Layout, Step};
 use crate::msg::{
-    ButtonMsg, CAP_INPUT_INJECT, ControlMsg, DatagramMsg, Enter, Heartbeat, InputMsg, KeyMsg,
-    Leave, MouseAbs, Pong, TakeControl, WheelMsg,
+    ButtonMsg, CAP_INPUT_INJECT, CAP_WHEEL_PIXEL, ControlMsg, DatagramMsg, Enter, Heartbeat,
+    InputMsg, KeyMsg, Leave, MouseAbs, Pong, TakeControl, WheelMsg,
 };
+use crate::os::pixels_to_notch120;
 use crate::remap::Remap;
 use crate::types::{
     CaptureFault, CapturedEvent, GeometryError, GrabCommand, Hid, InjectCommand, ModifierMask, Os,
@@ -277,6 +278,7 @@ impl Engine {
                 self.timings.heartbeat_timeout,
             ),
             peer_can_inject: peer.capabilities.iter().any(|c| c == CAP_INPUT_INJECT),
+            peer_takes_pixels: peer.capabilities.iter().any(|c| c == CAP_WHEEL_PIXEL),
             seq: 0,
             last_seq: 0,
             peer,
@@ -516,11 +518,16 @@ impl Engine {
                 }))])
             }
             CapturedEvent::Wheel { dx, dy, unit } => {
-                swallow(vec![Action::SendInput(InputMsg::Wheel(WheelMsg {
-                    dx,
-                    dy,
-                    unit,
-                }))])
+                let w = if unit == WheelUnit::Pixel && !s.peer_takes_pixels {
+                    WheelMsg {
+                        dx: pixels_to_notch120(dx),
+                        dy: pixels_to_notch120(dy),
+                        unit: WheelUnit::Notch120,
+                    }
+                } else {
+                    WheelMsg { dx, dy, unit }
+                };
+                swallow(vec![Action::SendInput(InputMsg::Wheel(w))])
             }
             CapturedEvent::MouseMove { delta, .. } => {
                 match s
@@ -773,7 +780,7 @@ impl Engine {
     }
 
     fn inject_wheel(&mut self, w: WheelMsg) -> Vec<Action> {
-        if self.controlled().is_none() || w.unit != WheelUnit::Notch120 {
+        if self.controlled().is_none() {
             return Vec::new();
         }
         vec![Action::Inject(InjectCommand::Wheel {

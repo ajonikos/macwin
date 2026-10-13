@@ -355,6 +355,133 @@ fn clipboard_limits_and_kinds_are_enforced() {
     assert!(matches!(decode_clipboard(&bad), Err(ProtoError::Decode(_))));
 }
 
+#[test]
+fn clipboard_images_round_trip_and_are_bounded() {
+    let m = ClipboardMsg::Image(macwin_core::msg::ClipboardImage {
+        clock: 3,
+        png: vec![0x89, b'P', b'N', b'G'],
+    });
+    assert_eq!(decode_clipboard(&encode_clipboard(&m)).unwrap(), m);
+    assert!(!format!("{m:?}").contains("80"), "no content in Debug");
+    let big = ClipboardMsg::Image(macwin_core::msg::ClipboardImage {
+        clock: 1,
+        png: vec![0; MAX_CLIPBOARD_IMAGE + 1],
+    });
+    assert!(!clipboard_within_limits(&big));
+}
+
+fn entry(path: &str, size: u64, dir: bool) -> wire::FileEntry {
+    wire::FileEntry {
+        path: path.into(),
+        size,
+        dir,
+        executable: false,
+        mtime_ms: 1_700_000_000_000,
+    }
+}
+
+fn decode_entries(
+    entries: Vec<wire::FileEntry>,
+) -> Result<macwin_core::msg::FilesHeader, ProtoError> {
+    decode_files_header(&wire::FilesHeader { clock: 7, entries }.encode_to_vec())
+}
+
+#[test]
+fn files_headers_round_trip() {
+    let h = macwin_core::msg::FilesHeader {
+        clock: 9,
+        entries: vec![
+            macwin_core::msg::FileEntry {
+                path: "Фото".into(),
+                size: 0,
+                dir: true,
+                executable: false,
+                mtime_ms: -5,
+            },
+            macwin_core::msg::FileEntry {
+                path: "Фото/a b.jpg".into(),
+                size: 123,
+                dir: false,
+                executable: true,
+                mtime_ms: 1_700_000_000_000,
+            },
+        ],
+    };
+    let back = decode_files_header(&encode_files_header(&h)).unwrap();
+    assert_eq!(back, h);
+    assert_eq!(back.total_bytes(), 123);
+}
+
+#[test]
+fn files_header_paths_cannot_escape() {
+    for bad in [
+        "",
+        "/etc/passwd",
+        "a//b",
+        "a/",
+        "./a",
+        "a/./b",
+        "../a",
+        "a/../../b",
+        "a\\b",
+        "a\0b",
+        "C:",
+        "c:/windows",
+        &"x".repeat(256),
+        &"a/"
+            .repeat(64)
+            .trim_end_matches('/')
+            .replace("a/a", "a/a/a"),
+    ] {
+        assert_invalid_value(
+            decode_entries(vec![entry(bad, 0, false)]),
+            "file_entry.path",
+        );
+    }
+    // Long but valid, and names that only Windows dislikes (mapped later).
+    assert!(decode_entries(vec![entry("a/".repeat(63).trim_end_matches('/'), 0, false)]).is_ok());
+    assert!(decode_entries(vec![entry("what?.txt", 1, false), entry("a:b", 1, false)]).is_ok());
+}
+
+#[test]
+fn files_header_structure_is_checked() {
+    assert_invalid_value(decode_entries(vec![entry("d", 5, true)]), "file_entry.size");
+    assert_invalid_value(
+        decode_entries(vec![entry("a", 1, false), entry("a", 2, false)]),
+        "file_entry.path",
+    );
+    assert_invalid_value(
+        decode_entries(vec![
+            entry("a", MAX_FILES_TOTAL, false),
+            entry("b", 1, false),
+        ]),
+        "files_header.entries",
+    );
+    assert_invalid_value(
+        decode_entries(vec![entry("a", u64::MAX, false), entry("b", 2, false)]),
+        "files_header.entries",
+    );
+    let many = (0..=MAX_FILE_ENTRIES)
+        .map(|i| entry(&format!("f{i}"), 0, false))
+        .collect();
+    assert_invalid_value(decode_entries(many), "files_header.entries");
+    assert_invalid_value(decode_entries(vec![]), "files_header.entries");
+    assert!(decode_files_header(&vec![0u8; MAX_FILES_HEADER + 1]).is_err());
+}
+
+#[test]
+fn packed_empty_entries_are_refused_before_decoding() {
+    // Tag 2, length 0: the smallest possible entry, repeated past the limit.
+    let mut b = vec![0x08, 0x07];
+    for _ in 0..=MAX_FILE_ENTRIES {
+        b.extend_from_slice(&[0x12, 0x00]);
+    }
+    assert_invalid_value(decode_files_header(&b), "files_header.entries");
+    // Truncated and group-encoded fields are malformed.
+    assert_invalid_value(decode_files_header(&[0x12, 0x05, 0x01]), "files header");
+    assert_invalid_value(decode_files_header(&[0x13]), "files header");
+}
+
 fn valid_pair_hello() -> wire::PairHello {
     wire::PairHello {
         protocol_version: PROTOCOL_VERSION,

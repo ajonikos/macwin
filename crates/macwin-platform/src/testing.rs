@@ -2,6 +2,7 @@
 //! All handles are `Clone` and thread-safe.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -10,9 +11,9 @@ use macwin_core::types::{
 };
 
 use crate::{
-    CLIPBOARD_ORIGIN_FORMAT, CaptureControl, CaptureSink, ClipboardBackend, ClipboardFormat,
-    ClipboardInfo, ClipboardSnapshot, InputCapture, InputInjector, LocalClipboard, PlatformError,
-    ScreenSource, SecretStore, check_secret_name,
+    CLIPBOARD_ORIGIN_FORMAT, CaptureControl, CaptureSink, ClipboardBackend, ClipboardContent,
+    ClipboardFormat, ClipboardInfo, ClipboardSnapshot, InputCapture, InputInjector, PlatformError,
+    ScreenSource, SecretStore, SnapshotLimits, check_secret_name,
 };
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -266,7 +267,17 @@ enum FakeContent {
     Empty,
     Text(String),
     Sensitive(String),
-    Image,
+    /// PNG bytes.
+    Image(Vec<u8>),
+    Files(Vec<PathBuf>),
+}
+
+/// Something macwin wrote to a [`FakeClipboard`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FakeWrite {
+    Text(String),
+    Image(Vec<u8>),
+    Files(Vec<PathBuf>),
 }
 
 #[derive(Default)]
@@ -274,8 +285,8 @@ struct ClipboardState {
     count: u64,
     content: FakeContent,
     ours: bool,
-    writes: Vec<String>,
-    text_reads: usize,
+    writes: Vec<FakeWrite>,
+    content_reads: usize,
 }
 
 /// Fake system clipboard with macwin's origin-marker semantics.
@@ -319,9 +330,14 @@ impl FakeClipboardHandle {
         self.set(FakeContent::Sensitive(text.into()));
     }
 
-    /// The user copies an image.
-    pub fn copy_image(&self) {
-        self.set(FakeContent::Image);
+    /// The user copies an image (PNG bytes).
+    pub fn copy_image(&self, png: &[u8]) {
+        self.set(FakeContent::Image(png.to_vec()));
+    }
+
+    /// The user copies files or folders in Finder / Explorer.
+    pub fn copy_files(&self, paths: &[PathBuf]) {
+        self.set(FakeContent::Files(paths.to_vec()));
     }
 
     /// A clipboard manager re-copies the current content without macwin's
@@ -335,18 +351,45 @@ impl FakeClipboardHandle {
     pub fn text(&self) -> Option<String> {
         match &lock(&self.state).content {
             FakeContent::Text(t) | FakeContent::Sensitive(t) => Some(t.clone()),
-            FakeContent::Empty | FakeContent::Image => None,
+            _ => None,
         }
     }
 
-    /// Every text macwin wrote, in order.
-    pub fn writes(&self) -> Vec<String> {
+    /// The image on the clipboard, as PNG.
+    pub fn image(&self) -> Option<Vec<u8>> {
+        match &lock(&self.state).content {
+            FakeContent::Image(png) => Some(png.clone()),
+            _ => None,
+        }
+    }
+
+    /// The files on the clipboard.
+    pub fn files(&self) -> Option<Vec<PathBuf>> {
+        match &lock(&self.state).content {
+            FakeContent::Files(p) => Some(p.clone()),
+            _ => None,
+        }
+    }
+
+    /// Everything macwin wrote, in order.
+    pub fn writes(&self) -> Vec<FakeWrite> {
         lock(&self.state).writes.clone()
     }
 
-    /// How many times macwin read text content.
-    pub fn text_reads(&self) -> usize {
-        lock(&self.state).text_reads
+    /// The texts macwin wrote, in order.
+    pub fn text_writes(&self) -> Vec<String> {
+        self.writes()
+            .into_iter()
+            .filter_map(|w| match w {
+                FakeWrite::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many times macwin read content (text, image or file list).
+    pub fn content_reads(&self) -> usize {
+        lock(&self.state).content_reads
     }
 
     pub fn change_count(&self) -> u64 {
@@ -378,9 +421,13 @@ impl ClipboardBackend for FakeClipboard {
                     size: Some(0),
                 });
             }
-            FakeContent::Image => formats.push(ClipboardFormat {
-                name: "image".into(),
-                size: None,
+            FakeContent::Image(png) => formats.push(ClipboardFormat {
+                name: "public.png".into(),
+                size: Some(png.len()),
+            }),
+            FakeContent::Files(p) => formats.push(ClipboardFormat {
+                name: "public.file-url".into(),
+                size: Some(p.len()),
             }),
         }
         if s.ours {
@@ -398,27 +445,44 @@ impl ClipboardBackend for FakeClipboard {
 
     fn read_text(&self) -> Result<Option<String>, PlatformError> {
         let mut s = lock(&self.state);
-        s.text_reads += 1;
+        s.content_reads += 1;
         Ok(match &s.content {
             FakeContent::Text(t) | FakeContent::Sensitive(t) => Some(t.clone()),
-            FakeContent::Empty | FakeContent::Image => None,
+            _ => None,
         })
     }
 
-    fn snapshot(&self, max_text_bytes: usize) -> Result<ClipboardSnapshot, PlatformError> {
+    fn snapshot(&self, limits: &SnapshotLimits) -> Result<ClipboardSnapshot, PlatformError> {
         let mut s = lock(&self.state);
         let content = if s.ours {
-            LocalClipboard::Ours
+            ClipboardContent::Ours
         } else {
             match s.content.clone() {
-                FakeContent::Sensitive(_) => LocalClipboard::Sensitive,
-                FakeContent::Empty | FakeContent::Image => LocalClipboard::NoText,
-                FakeContent::Text(t) if t.len() > max_text_bytes => {
-                    LocalClipboard::TooLarge { bytes: t.len() }
+                FakeContent::Sensitive(_) => ClipboardContent::Sensitive,
+                FakeContent::Empty => ClipboardContent::Unsupported,
+                FakeContent::Files(_) if !limits.files => ClipboardContent::Unsupported,
+                FakeContent::Files(p) => {
+                    s.content_reads += 1;
+                    ClipboardContent::Files(p)
+                }
+                FakeContent::Text(t) if t.len() > limits.max_text_bytes => {
+                    ClipboardContent::TooLarge {
+                        bytes: t.len() as u64,
+                    }
                 }
                 FakeContent::Text(t) => {
-                    s.text_reads += 1;
-                    LocalClipboard::Text(t)
+                    s.content_reads += 1;
+                    ClipboardContent::Text(t)
+                }
+                FakeContent::Image(_) if !limits.images => ClipboardContent::Unsupported,
+                FakeContent::Image(png) if png.len() > limits.max_image_bytes => {
+                    ClipboardContent::TooLarge {
+                        bytes: png.len() as u64,
+                    }
+                }
+                FakeContent::Image(png) => {
+                    s.content_reads += 1;
+                    ClipboardContent::Image(png)
                 }
             }
         };
@@ -429,12 +493,32 @@ impl ClipboardBackend for FakeClipboard {
     }
 
     fn write_text(&self, text: &str) -> Result<u64, PlatformError> {
+        Ok(self.write(FakeContent::Text(text.into()), FakeWrite::Text(text.into())))
+    }
+
+    fn write_image(&self, png: &[u8]) -> Result<u64, PlatformError> {
+        Ok(self.write(
+            FakeContent::Image(png.to_vec()),
+            FakeWrite::Image(png.to_vec()),
+        ))
+    }
+
+    fn write_files(&self, paths: &[PathBuf]) -> Result<u64, PlatformError> {
+        Ok(self.write(
+            FakeContent::Files(paths.to_vec()),
+            FakeWrite::Files(paths.to_vec()),
+        ))
+    }
+}
+
+impl FakeClipboard {
+    fn write(&self, content: FakeContent, record: FakeWrite) -> u64 {
         let mut s = lock(&self.state);
         s.count += 1;
-        s.content = FakeContent::Text(text.into());
+        s.content = content;
         s.ours = true;
-        s.writes.push(text.into());
-        Ok(s.count)
+        s.writes.push(record);
+        s.count
     }
 }
 
@@ -593,26 +677,54 @@ mod tests {
     #[test]
     fn fake_clipboard_classifies_like_a_real_backend() {
         let (cb, user) = FakeClipboard::new();
-        let snap = |cb: &FakeClipboard| cb.snapshot(5).unwrap().content;
-        assert_eq!(snap(&cb), LocalClipboard::NoText);
+        let all = SnapshotLimits {
+            max_text_bytes: 5,
+            images: true,
+            max_image_bytes: 3,
+            files: true,
+        };
+        let snap = |cb: &FakeClipboard, l: &SnapshotLimits| cb.snapshot(l).unwrap().content;
+        assert_eq!(snap(&cb, &all), ClipboardContent::Unsupported);
         user.copy_text("hello");
-        assert_eq!(snap(&cb), LocalClipboard::Text("hello".into()));
+        assert_eq!(snap(&cb, &all), ClipboardContent::Text("hello".into()));
         user.copy_text("longer");
-        assert_eq!(snap(&cb), LocalClipboard::TooLarge { bytes: 6 });
+        assert_eq!(snap(&cb, &all), ClipboardContent::TooLarge { bytes: 6 });
         user.copy_sensitive("pw");
-        assert_eq!(snap(&cb), LocalClipboard::Sensitive);
-        user.copy_image();
-        assert_eq!(snap(&cb), LocalClipboard::NoText);
-        let reads = user.text_reads();
+        assert_eq!(snap(&cb, &all), ClipboardContent::Sensitive);
+        user.copy_image(&[1, 2]);
+        assert_eq!(snap(&cb, &all), ClipboardContent::Image(vec![1, 2]));
+        assert_eq!(
+            snap(&cb, &SnapshotLimits::text_only(5)),
+            ClipboardContent::Unsupported
+        );
+        user.copy_image(&[1, 2, 3, 4]);
+        assert_eq!(snap(&cb, &all), ClipboardContent::TooLarge { bytes: 4 });
+        let paths = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        user.copy_files(&paths);
+        assert_eq!(snap(&cb, &all), ClipboardContent::Files(paths.clone()));
+        assert_eq!(
+            snap(&cb, &SnapshotLimits::text_only(5)),
+            ClipboardContent::Unsupported,
+            "file names are never shared as text"
+        );
+        let reads = user.content_reads();
         let count = cb.write_text("abc").unwrap();
         assert_eq!(count, user.change_count());
-        assert_eq!(snap(&cb), LocalClipboard::Ours);
-        assert_eq!(user.text_reads(), reads, "own writes are never read");
+        assert_eq!(snap(&cb, &all), ClipboardContent::Ours);
+        assert_eq!(user.content_reads(), reads, "own writes are never read");
         assert!(cb.inspect().unwrap().ours);
         user.recopy();
-        assert_eq!(snap(&cb), LocalClipboard::Text("abc".into()));
-        assert_eq!(user.writes(), vec!["abc".to_string()]);
-        assert_eq!(cb.read_text().unwrap().as_deref(), Some("abc"));
+        assert_eq!(snap(&cb, &all), ClipboardContent::Text("abc".into()));
+        cb.write_image(&[7]).unwrap();
+        assert_eq!(user.image(), Some(vec![7]));
+        cb.write_files(&paths).unwrap();
+        assert_eq!(user.files(), Some(paths.clone()));
+        assert_eq!(user.text_writes(), vec!["abc".to_string()]);
+        assert_eq!(user.writes().len(), 3);
+        assert_eq!(
+            format!("{:?}", ClipboardContent::Text("secret".into())),
+            "Text(6 bytes)"
+        );
     }
 
     #[test]

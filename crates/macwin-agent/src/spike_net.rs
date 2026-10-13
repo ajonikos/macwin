@@ -138,7 +138,7 @@ fn heartbeat_ticker() -> tokio::time::Interval {
 /// Returns Ok when the peer closes normally.
 pub async fn run_listener(session: Session) -> anyhow::Result<()> {
     let Session {
-        link: Link { tx, mut rx },
+        link: Link { tx, mut rx, .. },
         ..
     } = session;
     let mut hb = HeartbeatMonitor::with_defaults(Instant::now());
@@ -185,7 +185,7 @@ enum Path {
 /// normally and waits for the close to reach the peer.
 pub async fn run_dialer(session: Session, opts: SpikeOpts) -> anyhow::Result<Report> {
     let Session {
-        link: Link { tx, mut rx },
+        link: Link { tx, mut rx, .. },
         ..
     } = session;
     let anchor = Instant::now();

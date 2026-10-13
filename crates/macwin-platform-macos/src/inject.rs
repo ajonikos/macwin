@@ -7,7 +7,7 @@ use macwin_core::keymap::hid_to_mac;
 use macwin_core::keys::ButtonSet;
 use macwin_core::os::INJECT_TAG;
 use macwin_core::os::macos::{ClickCounter, WheelAccumulator, flags_for};
-use macwin_core::types::{InjectCommand, ModifierMask, MouseButton, Point, PointF};
+use macwin_core::types::{InjectCommand, ModifierMask, MouseButton, Point, PointF, WheelUnit};
 use macwin_platform::{InputInjector, PlatformError};
 use objc2_app_kit::NSEvent;
 use objc2_core_foundation::{CFRetained, CGPoint};
@@ -56,8 +56,8 @@ impl MacInjector {
             mods: ModifierMask::EMPTY,
             clicks: ClickCounter::new(),
             click_state: [1; 5],
-            wheel_x: WheelAccumulator::new(),
-            wheel_y: WheelAccumulator::new(),
+            wheel_x: WheelAccumulator::pixels(),
+            wheel_y: WheelAccumulator::pixels(),
             pos: None,
             double_click,
         })
@@ -143,20 +143,24 @@ impl MacInjector {
         self.post(e)
     }
 
-    fn wheel(&mut self, dx: i32, dy: i32) -> Result<(), PlatformError> {
-        let lines_y = self.wheel_y.push(dy);
-        let lines_x = self.wheel_x.push(dx);
-        if lines_x == 0 && lines_y == 0 {
+    fn wheel(&mut self, dx: i32, dy: i32, unit: WheelUnit) -> Result<(), PlatformError> {
+        // Pixels, not lines: high-resolution deltas (precision touchpads)
+        // stay smooth instead of being rounded to whole lines.
+        let (px_x, px_y) = match unit {
+            WheelUnit::Notch120 => (self.wheel_x.push(dx), self.wheel_y.push(dy)),
+            WheelUnit::Pixel => (dx, dy),
+        };
+        if px_x == 0 && px_y == 0 {
             return Ok(());
         }
         // wheel1 is vertical (up > 0); wheel2 is horizontal with left > 0
         // (sign unverified on hardware, mirrors scroll_from_fixed).
         let e = CGEvent::new_scroll_wheel_event2(
             Some(&self.source),
-            CGScrollEventUnit::Line,
+            CGScrollEventUnit::Pixel,
             2,
-            lines_y,
-            -lines_x,
+            px_y,
+            -px_x,
             0,
         );
         self.post(e)
@@ -180,7 +184,11 @@ impl MacInjector {
         }
         let e = CGEvent::new_keyboard_event(Some(&self.source), code, down);
         if let Some(e) = &e {
-            CGEvent::set_flags(Some(e), CGEventFlags(flags_for(self.mods)));
+            // Keep the machine's Caps Lock state: the injected modifiers
+            // would otherwise clear it for this event.
+            let caps = CGEventSource::flags_state(CGEventSourceStateID::HIDSystemState).0
+                & CGEventFlags::MaskAlphaShift.0;
+            CGEvent::set_flags(Some(e), CGEventFlags(flags_for(self.mods) | caps));
             if repeat {
                 CGEvent::set_integer_value_field(Some(e), CGEventField::KeyboardEventAutorepeat, 1);
             }
@@ -198,7 +206,7 @@ impl InputInjector for MacInjector {
         match cmd {
             InjectCommand::MoveTo(p) => self.move_to(p),
             InjectCommand::Button { button, down, at } => self.button(button, down, at),
-            InjectCommand::Wheel { dx, dy, .. } => self.wheel(dx, dy),
+            InjectCommand::Wheel { dx, dy, unit } => self.wheel(dx, dy, unit),
             InjectCommand::Key { hid, down, repeat } => self.key(hid, down, repeat),
         }
     }

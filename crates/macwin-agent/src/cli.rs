@@ -65,7 +65,8 @@ pub enum ConfigCmd {
     Show,
     /// Change one setting. Keys: side (left|right|none), address
     /// (HOST[:PORT]|none), listen (ADDR:PORT), remap (on|off), clipboard
-    /// (on|off), clipboard-max-kb (1-16384).
+    /// (on|off), clipboard-max-kb (1-16384), clipboard-images (on|off),
+    /// clipboard-files (on|off), clipboard-files-max-mb (1-65536).
     Set { key: String, value: String },
 }
 

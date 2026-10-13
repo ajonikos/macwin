@@ -18,7 +18,7 @@ pub mod tls;
 
 pub use endpoint::{Listener, connect, listen};
 pub use fingerprint::Fingerprint;
-pub use identity::{Identity, config_dir};
+pub use identity::{Identity, cache_dir, config_dir};
 pub use link::{Inbound, Link, LinkClosed, LinkError, LinkSender};
 pub use pairing::{PairInfo, PairListener, PairedPeer, PairingCode, pair_connect, pair_listen};
 pub use session::{HELLO_TIMEOUT, Session};

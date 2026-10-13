@@ -294,10 +294,31 @@ pub async fn run() -> anyhow::Result<()> {
     let side = peer
         .side
         .context("tell macwin where the peer's screens are: macwin config set side left|right")?;
-    let clipboard = config
-        .clipboard
-        .enabled
-        .then(|| ClipboardSettings::new(config.clipboard.max_text_bytes()));
+    let staging = macwin_net::cache_dir(|k| std::env::var_os(k))?.join("incoming");
+    let c = &config.clipboard;
+    let clipboard = c.enabled.then(|| ClipboardSettings {
+        max_text_bytes: c.max_text_bytes(),
+        images: c.images,
+        max_image_bytes: macwin_proto::MAX_CLIPBOARD_IMAGE,
+        files: c.files,
+        max_files_bytes: c.max_files_bytes(),
+        staging,
+        poll: crate::clipboard::POLL_INTERVAL,
+    });
+    let with_clipboard = clipboard.is_some();
+    let sharing = match &clipboard {
+        None => "off".to_string(),
+        Some(s) => {
+            let mut kinds = vec!["text"];
+            if s.images {
+                kinds.push("images");
+            }
+            if s.files {
+                kinds.push("files");
+            }
+            kinds.join(", ")
+        }
+    };
     let session = SessionConfig {
         local_os: os,
         os_version: String::new(),
@@ -312,11 +333,10 @@ pub async fn run() -> anyhow::Result<()> {
         None => Mode::Listen(config.listen),
     };
     println!(
-        "sharing with \"{}\" ({}), whose screens are on the {}; clipboard {}",
+        "sharing with \"{}\" ({}), whose screens are on the {}; clipboard: {sharing}",
         peer.name,
         os_name(peer.os),
         side_name(side),
-        if clipboard.is_some() { "on" } else { "off" }
     );
     println!("emergency release: {EMERGENCY_CHORD}. Ctrl+C here stops macwin.");
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -332,7 +352,6 @@ pub async fn run() -> anyhow::Result<()> {
         retry_max: runner::RETRY_MAX,
         connect_timeout: runner::CONNECT_TIMEOUT,
     };
-    let with_clipboard = clipboard.is_some();
     let exit = runner::run(
         opts,
         id.identity,

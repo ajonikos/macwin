@@ -330,10 +330,7 @@ async fn clipboard_updates_cross_on_their_own_streams() {
         }
     }
     // Separate streams may arrive in any order.
-    got.sort_by_key(|m| match m {
-        ClipboardMsg::Text(t) => t.clock,
-        ClipboardMsg::Other { clock } => *clock,
-    });
+    got.sort_by_key(ClipboardMsg::clock);
     assert_eq!(got, msgs);
     // Oversized updates are refused locally.
     let huge = ClipboardMsg::Text(ClipboardText {
@@ -466,5 +463,131 @@ mod pairing {
             matches!(&l, Err(e) if !matches!(e, NetError::PairingFailed(_))),
             "{l:?}"
         );
+    }
+}
+
+mod files {
+    use macwin_core::msg::{FileEntry, FilesHeader};
+    use macwin_net::link::{FilesDelivery, Link};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{T, good_pair};
+
+    fn header(sizes: &[u64]) -> FilesHeader {
+        FilesHeader {
+            clock: 4,
+            entries: sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &size)| FileEntry {
+                    path: format!("dir/f{i}.bin"),
+                    size,
+                    dir: false,
+                    executable: false,
+                    mtime_ms: 0,
+                })
+                .collect(),
+        }
+    }
+
+    fn data(len: u64, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31) ^ seed)
+            .collect()
+    }
+
+    /// Sends the header and data, receives and compares them.
+    async fn round_trip(a: &macwin_net::Session, b: &mut Link, sizes: &[u64]) {
+        let h = header(sizes);
+        let mut out = a.link.tx.send_files(&h).await.unwrap();
+        let sender = async move {
+            for (i, &size) in sizes.iter().enumerate() {
+                out.write_all(&data(size, i as u8)).await.unwrap();
+            }
+            out.finish().await.unwrap()
+        };
+        let receiver = async {
+            let mut incoming = tokio::time::timeout(T, b.files.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(incoming.header, h);
+            let mut all = Vec::new();
+            incoming.body.read_to_end(&mut all).await.unwrap();
+            all
+        };
+        let (delivery, all) = tokio::join!(sender, receiver);
+        assert_eq!(delivery, FilesDelivery::Delivered);
+        let expected: Vec<u8> = sizes
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &s)| data(s, i as u8))
+            .collect();
+        assert_eq!(all.len(), expected.len());
+        assert!(all == expected, "data differs");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn files_cross_on_their_own_stream() {
+        let (a, mut b) = good_pair().await;
+        round_trip(&a, &mut b.link, &[3 << 20, 0, 12_345]).await;
+        // Over the in-memory link too.
+        let (ma, mut mb) = Link::memory_pair();
+        let h = header(&[70_000]);
+        let mut out = ma.tx.send_files(&h).await.unwrap();
+        let writer = tokio::spawn(async move {
+            out.write_all(&data(70_000, 0)).await.unwrap();
+            out.finish().await.unwrap()
+        });
+        let mut incoming = mb.files.recv().await.unwrap();
+        let mut all = Vec::new();
+        incoming.body.read_to_end(&mut all).await.unwrap();
+        assert_eq!(all, data(70_000, 0));
+        assert_eq!(writer.await.unwrap(), FilesDelivery::Delivered);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_transfer_errors_on_the_receiver() {
+        let (a, mut b) = good_pair().await;
+        let h = header(&[1 << 20]);
+        let mut out = a.link.tx.send_files(&h).await.unwrap();
+        out.write_all(&data(1000, 1)).await.unwrap();
+        out.flush().await.unwrap();
+        let mut incoming = tokio::time::timeout(T, b.link.files.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        out.cancel();
+        let mut all = Vec::new();
+        let r = tokio::time::timeout(T, incoming.body.read_to_end(&mut all))
+            .await
+            .unwrap();
+        assert!(r.is_err(), "a reset stream is an error, not a short file");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_receiver_that_drops_the_transfer_stops_the_sender() {
+        let (a, mut b) = good_pair().await;
+        let h = header(&[8 << 20]);
+        let mut out = a.link.tx.send_files(&h).await.unwrap();
+        let incoming = tokio::time::timeout(T, b.link.files.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(incoming);
+        let chunk = vec![0u8; 64 * 1024];
+        let mut failed = false;
+        for _ in 0..128 {
+            if out.write_all(&chunk).await.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        let stopped = failed
+            || out
+                .finish()
+                .await
+                .is_ok_and(|d| d == FilesDelivery::Stopped);
+        assert!(stopped, "the sender noticed the stop");
     }
 }

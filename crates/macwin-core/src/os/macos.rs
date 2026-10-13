@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::PIXELS_PER_NOTCH;
 use crate::types::{Hid, ModifierMask, MouseButton, PointF};
 
 // Device-dependent modifier bits (NX_DEVICE*KEYMASK), one per physical key.
@@ -130,24 +131,52 @@ fn clamp_i32(v: f64) -> i32 {
     }
 }
 
-/// Turns 1/120 wheel units into whole lines, carrying the remainder (with
-/// its sign) to the next call.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Converts `kCGScrollWheelEventPointDeltaAxis1/2` of a continuous scroll
+/// (pixels, positive = up / left) into macwin pixel deltas (`dy > 0` up,
+/// `dx > 0` right), like [`scroll_from_fixed`].
+pub fn scroll_from_points(axis1: i64, axis2: i64) -> (i32, i32) {
+    let clamp = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    (clamp(axis2.saturating_neg()), clamp(axis1))
+}
+
+/// Turns 1/120 wheel units into whole steps (lines, or pixels), carrying
+/// the remainder (with its sign) to the next call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WheelAccumulator {
+    /// 1/120 units per step.
+    step: i64,
     remainder: i64,
 }
 
+impl Default for WheelAccumulator {
+    fn default() -> WheelAccumulator {
+        WheelAccumulator::new()
+    }
+}
+
 impl WheelAccumulator {
+    /// Whole lines (120 units each).
     pub fn new() -> WheelAccumulator {
-        WheelAccumulator::default()
+        WheelAccumulator {
+            step: 120,
+            remainder: 0,
+        }
     }
 
-    /// Adds `delta` (1/120 units) and returns the whole lines to scroll now.
+    /// Whole pixels, [`PIXELS_PER_NOTCH`] per 120 units.
+    pub fn pixels() -> WheelAccumulator {
+        WheelAccumulator {
+            step: i64::from(120 / PIXELS_PER_NOTCH),
+            remainder: 0,
+        }
+    }
+
+    /// Adds `delta` (1/120 units) and returns the whole steps to scroll now.
     pub fn push(&mut self, delta: i32) -> i32 {
         let total = self.remainder + i64::from(delta);
-        let lines = total / 120; // truncates toward zero
-        self.remainder = total - lines * 120;
-        lines.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        let steps = total / self.step; // truncates toward zero
+        self.remainder = total - steps * self.step;
+        steps.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
     }
 
     pub fn remainder(&self) -> i32 {
@@ -239,6 +268,9 @@ mod tests {
         assert_eq!(scroll_from_fixed(-0.5, 0.0), (0, -60));
         assert_eq!(scroll_from_fixed(0.0, 1.0), (-120, 0));
         assert_eq!(scroll_from_fixed(f64::NAN, f64::INFINITY), (i32::MIN, 0));
+        assert_eq!(scroll_from_points(7, 0), (0, 7));
+        assert_eq!(scroll_from_points(0, 3), (-3, 0));
+        assert_eq!(scroll_from_points(i64::MIN, i64::MAX), (i32::MIN, i32::MIN));
     }
 
     #[test]
@@ -254,6 +286,17 @@ mod tests {
         assert_eq!(w.push(-30), 0);
         assert_eq!(w.remainder(), -30);
         assert_eq!(w.push(-90), -1);
+    }
+
+    #[test]
+    fn pixel_accumulator_keeps_touchpad_deltas() {
+        let mut w = WheelAccumulator::pixels();
+        assert_eq!(w.push(120), PIXELS_PER_NOTCH, "one notch");
+        // A precision touchpad sends a few units at a time: nothing is lost.
+        let total: i32 = (0..30).map(|_| w.push(5)).sum();
+        assert_eq!(total, 50);
+        assert_eq!(w.push(-1), 0);
+        assert_eq!(w.push(-2), -1);
     }
 
     #[test]

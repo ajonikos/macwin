@@ -155,7 +155,8 @@ impl MouseButton {
 pub enum WheelUnit {
     /// 120 = one detent (Windows `WHEEL_DELTA`); smaller values are high-res.
     Notch120,
-    /// Reserved for Phase 2 (smooth scrolling); the Engine ignores it.
+    /// Pixels of continuous scrolling (Mac trackpads and Magic Mouse);
+    /// [`crate::os::PIXELS_PER_NOTCH`] pixels make one notch.
     Pixel,
 }
 

@@ -38,6 +38,7 @@ macwin-platform-windows = { workspace = true }
 
 [dev-dependencies]
 macwin-platform = { workspace = true, features = ["testing"] }
+png = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

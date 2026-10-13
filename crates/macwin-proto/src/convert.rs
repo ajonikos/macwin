@@ -4,9 +4,9 @@
 
 use macwin_core::geometry::ScreenSet;
 use macwin_core::msg::{
-    ButtonMsg, ClipboardMsg, ClipboardText, ControlMsg, DatagramMsg, Enter, Heartbeat, Hello,
-    InputMsg, KeyMsg, Leave, MouseAbs, PairConfirm, PairHello, PairMsg, Ping, Pong, TakeControl,
-    WheelMsg,
+    ButtonMsg, ClipboardImage, ClipboardMsg, ClipboardText, ControlMsg, DatagramMsg, Enter,
+    FileEntry, FilesHeader, Heartbeat, Hello, InputMsg, KeyMsg, Leave, MouseAbs, PairConfirm,
+    PairHello, PairMsg, Ping, Pong, TakeControl, WheelMsg,
 };
 use macwin_core::types::{
     GeometryError, Hid, ModifierMask, MouseButton, Os, Point, Rect, RoleKind, ScreenInfo, Side,
@@ -15,8 +15,9 @@ use macwin_core::types::{
 
 use crate::wire::{self, clipboard_frame, control_frame, datagram_frame, input_frame, pair_frame};
 use crate::{
-    MAX_CAPABILITIES, MAX_CAPABILITY_LEN, MAX_CLIPBOARD_TEXT, MAX_STRING_LEN, PAIR_MAC_LEN,
-    ProtoError, SPAKE_MSG_LEN,
+    MAX_CAPABILITIES, MAX_CAPABILITY_LEN, MAX_CLIPBOARD_IMAGE, MAX_CLIPBOARD_TEXT, MAX_FILE_DEPTH,
+    MAX_FILE_ENTRIES, MAX_FILE_PATH_LEN, MAX_FILES_TOTAL, MAX_STRING_LEN, PAIR_MAC_LEN, ProtoError,
+    SPAKE_MSG_LEN,
 };
 
 // ---------- domain -> wire ----------
@@ -160,6 +161,10 @@ pub(crate) fn clipboard_to_wire(m: &ClipboardMsg) -> wire::ClipboardFrame {
         ClipboardMsg::Other { clock } => {
             clipboard_frame::Kind::Other(wire::ClipboardOther { clock: *clock })
         }
+        ClipboardMsg::Image(i) => clipboard_frame::Kind::Image(wire::ClipboardImage {
+            clock: i.clock,
+            png: i.png.clone(),
+        }),
     };
     wire::ClipboardFrame { kind: Some(kind) }
 }
@@ -430,7 +435,122 @@ pub(crate) fn clipboard_from_wire(f: wire::ClipboardFrame) -> Result<ClipboardMs
             }))
         }
         clipboard_frame::Kind::Other(o) => Ok(ClipboardMsg::Other { clock: o.clock }),
+        clipboard_frame::Kind::Image(i) => {
+            if i.png.len() > MAX_CLIPBOARD_IMAGE {
+                return Err(ProtoError::InvalidValue {
+                    field: "clipboard_image.png",
+                    reason: "image larger than 64 MiB",
+                });
+            }
+            Ok(ClipboardMsg::Image(ClipboardImage {
+                clock: i.clock,
+                png: i.png,
+            }))
+        }
     }
+}
+
+pub(crate) fn files_header_to_wire(h: &FilesHeader) -> wire::FilesHeader {
+    wire::FilesHeader {
+        clock: h.clock,
+        entries: h
+            .entries
+            .iter()
+            .map(|e| wire::FileEntry {
+                path: e.path.clone(),
+                size: e.size,
+                dir: e.dir,
+                executable: e.executable,
+                mtime_ms: e.mtime_ms,
+            })
+            .collect(),
+    }
+}
+
+fn invalid_path(reason: &'static str) -> ProtoError {
+    ProtoError::InvalidValue {
+        field: "file_entry.path",
+        reason,
+    }
+}
+
+/// A relative `/`-separated path that cannot escape the receiving
+/// directory on any OS. Name characters that only Windows rejects are
+/// mapped by the receiver, not refused here.
+pub fn check_relative_path(path: &str) -> Result<(), ProtoError> {
+    if path.is_empty() || path.len() > MAX_FILE_PATH_LEN {
+        return Err(invalid_path("empty or longer than 4096 bytes"));
+    }
+    if path.contains(['\\', '\0']) {
+        return Err(invalid_path("contains a backslash or NUL"));
+    }
+    let mut depth = 0;
+    for component in path.split('/') {
+        depth += 1;
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(invalid_path("empty, '.' or '..' component"));
+        }
+        if component.len() > 255 {
+            return Err(invalid_path("component longer than 255 bytes"));
+        }
+        // A drive or stream prefix ("C:", "a:b") must not reach Windows paths
+        // unmapped; ':' is a plain character on macOS and is mapped there.
+        if depth == 1 && component.len() == 2 && component.as_bytes()[1] == b':' {
+            return Err(invalid_path("drive prefix"));
+        }
+    }
+    if depth > MAX_FILE_DEPTH {
+        return Err(invalid_path("nested deeper than 64 levels"));
+    }
+    Ok(())
+}
+
+pub(crate) fn files_header_from_wire(h: wire::FilesHeader) -> Result<FilesHeader, ProtoError> {
+    if h.entries.len() > MAX_FILE_ENTRIES {
+        return Err(ProtoError::InvalidValue {
+            field: "files_header.entries",
+            reason: "more than 65536 entries",
+        });
+    }
+    if h.entries.is_empty() {
+        return Err(ProtoError::InvalidValue {
+            field: "files_header.entries",
+            reason: "no entries",
+        });
+    }
+    let mut seen = std::collections::HashSet::with_capacity(h.entries.len());
+    let mut total: u64 = 0;
+    let mut entries = Vec::with_capacity(h.entries.len());
+    for e in h.entries {
+        check_relative_path(&e.path)?;
+        if e.dir && e.size != 0 {
+            return Err(ProtoError::InvalidValue {
+                field: "file_entry.size",
+                reason: "a directory carries data",
+            });
+        }
+        if !seen.insert(e.path.clone()) {
+            return Err(invalid_path("duplicate path"));
+        }
+        total = total
+            .checked_add(e.size)
+            .filter(|t| *t <= MAX_FILES_TOTAL)
+            .ok_or(ProtoError::InvalidValue {
+                field: "files_header.entries",
+                reason: "more than 64 GiB in total",
+            })?;
+        entries.push(FileEntry {
+            path: e.path,
+            size: e.size,
+            dir: e.dir,
+            executable: e.executable,
+            mtime_ms: e.mtime_ms,
+        });
+    }
+    Ok(FilesHeader {
+        clock: h.clock,
+        entries,
+    })
 }
 
 pub(crate) fn pair_from_wire(f: wire::PairFrame) -> Result<PairMsg, ProtoError> {

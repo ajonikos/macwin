@@ -2,7 +2,9 @@
 //! `dwExtraInfo`; our hooks skip injected input anyway (`LL*HF_INJECTED`).
 
 use macwin_core::os::INJECT_TAG;
-use macwin_core::os::windows::{WinKey, XBUTTON1, XBUTTON2, key_injection, normalize_absolute};
+use macwin_core::os::windows::{
+    WinKey, XBUTTON1, XBUTTON2, key_injection, normalize_absolute, wheel_data,
+};
 use macwin_core::types::{Hid, InjectCommand, MouseButton, Point};
 use macwin_platform::{InputInjector, PlatformError};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -126,7 +128,8 @@ impl InputInjector for WinInjector {
                 };
                 send(mouse(0, 0, data, flags))
             }
-            InjectCommand::Wheel { dx, dy, .. } => {
+            InjectCommand::Wheel { dx, dy, unit } => {
+                let (dx, dy) = (wheel_data(dx, unit), wheel_data(dy, unit));
                 if dy != 0 {
                     send(mouse(0, 0, dy as u32, MOUSEEVENTF_WHEEL))?;
                 }

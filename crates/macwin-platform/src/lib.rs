@@ -10,13 +10,15 @@
 //! [`CaptureSink::on_event`] without blocking.
 #![forbid(unsafe_code)]
 
+use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-pub use macwin_core::clipboard::LocalClipboard;
 use macwin_core::types::{CaptureFault, CapturedEvent, GrabCommand, InjectCommand, ScreenInfo};
 
 pub mod fs;
+pub mod image;
 mod secrets;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -96,12 +98,72 @@ pub const WIN_SENSITIVE_FORMATS: [&str; 2] = [
 /// Windows format holding a DWORD; 0 means "do not sync to other devices".
 pub const WIN_CLOUD_FORMAT: &str = "CanUploadToCloudClipboard";
 
+/// What the OS clipboard holds, as classified by a backend. Priority when
+/// several kinds are present: macwin's own write, private content, files,
+/// text, image.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ClipboardContent {
+    /// macwin wrote it (origin marker present).
+    Ours,
+    /// Marked private by the source app (password managers).
+    Sensitive,
+    /// Nothing that is shared (empty, another kind, or a kind turned off).
+    Unsupported,
+    /// Text or image over the limit; `bytes` is a lower bound of the size.
+    TooLarge {
+        bytes: u64,
+    },
+    Text(String),
+    /// PNG, converted from the OS's native image format when needed.
+    Image(Vec<u8>),
+    /// The copied files and folders.
+    Files(Vec<PathBuf>),
+}
+
+/// Never prints content.
+impl fmt::Debug for ClipboardContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ClipboardContent::Ours => f.write_str("Ours"),
+            ClipboardContent::Sensitive => f.write_str("Sensitive"),
+            ClipboardContent::Unsupported => f.write_str("Unsupported"),
+            ClipboardContent::TooLarge { bytes } => write!(f, "TooLarge({bytes} bytes)"),
+            ClipboardContent::Text(t) => write!(f, "Text({} bytes)", t.len()),
+            ClipboardContent::Image(png) => write!(f, "Image({} bytes)", png.len()),
+            ClipboardContent::Files(p) => write!(f, "Files({} items)", p.len()),
+        }
+    }
+}
+
+/// What [`ClipboardBackend::snapshot`] may read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotLimits {
+    pub max_text_bytes: usize,
+    /// Read images (otherwise an image-only clipboard is `Unsupported`).
+    pub images: bool,
+    pub max_image_bytes: usize,
+    /// Report copied files (otherwise they are `Unsupported`, never their
+    /// names as text).
+    pub files: bool,
+}
+
+impl SnapshotLimits {
+    pub fn text_only(max_text_bytes: usize) -> SnapshotLimits {
+        SnapshotLimits {
+            max_text_bytes,
+            images: false,
+            max_image_bytes: 0,
+            files: false,
+        }
+    }
+}
+
 /// What a clipboard watcher needs after a change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardSnapshot {
     /// The change count the content belongs to (read before the content).
     pub change_count: u64,
-    pub content: LocalClipboard,
+    pub content: ClipboardContent,
 }
 
 /// One format currently on the clipboard. Never carries content.
@@ -130,14 +192,18 @@ pub trait ClipboardBackend: Send {
     /// counts as a programmatic pasteboard read (privacy alert).
     fn inspect(&self) -> Result<ClipboardInfo, PlatformError>;
     fn read_text(&self) -> Result<Option<String>, PlatformError>;
-    /// Classifies the clipboard for synchronisation. Reads the text only
-    /// when it is plain text that is neither macwin's own nor marked
-    /// private, and returns [`LocalClipboard::TooLarge`] instead of texts
-    /// over `max_text_bytes`.
-    fn snapshot(&self, max_text_bytes: usize) -> Result<ClipboardSnapshot, PlatformError>;
-    /// Replaces the clipboard with `text` plus the origin marker and returns
-    /// the change count right after the write.
+    /// Classifies the clipboard for synchronisation (see
+    /// [`ClipboardContent`] for the priority). Reads content only when it
+    /// is going to be shared: never macwin's own writes or private content.
+    fn snapshot(&self, limits: &SnapshotLimits) -> Result<ClipboardSnapshot, PlatformError>;
+    /// Each `write_*` replaces the clipboard (plus the origin marker) and
+    /// returns the change count right after the write.
     fn write_text(&self, text: &str) -> Result<u64, PlatformError>;
+    /// `png` is put on the clipboard in the OS's usual image formats.
+    fn write_image(&self, png: &[u8]) -> Result<u64, PlatformError>;
+    /// Puts existing files and folders on the clipboard, so that pasting in
+    /// Finder / Explorer copies them.
+    fn write_files(&self, paths: &[PathBuf]) -> Result<u64, PlatformError>;
 }
 
 /// Backend for hosts without an implementation: every call fails with
@@ -179,11 +245,19 @@ impl ClipboardBackend for UnsupportedPlatform {
         Err(PlatformError::Unsupported)
     }
 
-    fn snapshot(&self, _max_text_bytes: usize) -> Result<ClipboardSnapshot, PlatformError> {
+    fn snapshot(&self, _limits: &SnapshotLimits) -> Result<ClipboardSnapshot, PlatformError> {
         Err(PlatformError::Unsupported)
     }
 
     fn write_text(&self, _text: &str) -> Result<u64, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    fn write_image(&self, _png: &[u8]) -> Result<u64, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    fn write_files(&self, _paths: &[PathBuf]) -> Result<u64, PlatformError> {
         Err(PlatformError::Unsupported)
     }
 }
@@ -219,7 +293,18 @@ mod tests {
         assert!(matches!(p.change_count(), Err(PlatformError::Unsupported)));
         assert!(matches!(p.inspect(), Err(PlatformError::Unsupported)));
         assert!(matches!(p.read_text(), Err(PlatformError::Unsupported)));
-        assert!(matches!(p.snapshot(10), Err(PlatformError::Unsupported)));
+        assert!(matches!(
+            p.snapshot(&SnapshotLimits::text_only(10)),
+            Err(PlatformError::Unsupported)
+        ));
+        assert!(matches!(
+            p.write_image(&[]),
+            Err(PlatformError::Unsupported)
+        ));
+        assert!(matches!(
+            p.write_files(&[]),
+            Err(PlatformError::Unsupported)
+        ));
         assert!(matches!(p.write_text("x"), Err(PlatformError::Unsupported)));
     }
 }

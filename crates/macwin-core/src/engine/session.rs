@@ -90,6 +90,8 @@ pub(crate) struct Session {
     pub(crate) role: Role,
     pub(crate) heartbeat: HeartbeatMonitor,
     pub(crate) peer_can_inject: bool,
+    /// The peer injects pixel wheel deltas ([`crate::msg::CAP_WHEEL_PIXEL`]).
+    pub(crate) peer_takes_pixels: bool,
     /// Last datagram sequence number sent.
     pub(crate) seq: u64,
     /// Last datagram sequence number accepted.

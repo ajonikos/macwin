@@ -168,6 +168,42 @@ pub fn config_dir(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, Net
     config_dir_for(ConfigOs::current(), env)
 }
 
+/// The cache directory (received files wait there until they are pasted).
+/// A non-empty `MACWIN_CACHE_DIR` wins; with only `MACWIN_CONFIG_DIR` set
+/// it is `<config dir>/cache`, so test setups stay self-contained.
+pub fn cache_dir(env: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, NetError> {
+    cache_dir_for(ConfigOs::current(), env)
+}
+
+/// [`cache_dir`] for an explicit OS family.
+pub fn cache_dir_for(
+    os: ConfigOs,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> Result<PathBuf, NetError> {
+    let var = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(dir) = var("MACWIN_CACHE_DIR") {
+        return Ok(dir);
+    }
+    if let Some(dir) = var("MACWIN_CONFIG_DIR") {
+        return Ok(dir.join("cache"));
+    }
+    let missing = |k: &str| NetError::ConfigDir(format!("{k} is not set; set MACWIN_CACHE_DIR"));
+    match os {
+        ConfigOs::MacOs => Ok(var("HOME")
+            .ok_or_else(|| missing("HOME"))?
+            .join("Library/Caches/macwin")),
+        ConfigOs::Windows => Ok(var("LOCALAPPDATA")
+            .ok_or_else(|| missing("LOCALAPPDATA"))?
+            .join("macwin")),
+        ConfigOs::OtherUnix => match var("XDG_CACHE_HOME") {
+            Some(xdg) => Ok(xdg.join("macwin")),
+            None => Ok(var("HOME")
+                .ok_or_else(|| missing("HOME"))?
+                .join(".cache/macwin")),
+        },
+    }
+}
+
 /// [`config_dir`] for an explicit OS family.
 pub fn config_dir_for(
     os: ConfigOs,
@@ -250,6 +286,35 @@ mod tests {
             config_dir_for(ConfigOs::Windows, env_of(&[("HOME", "/h")])),
             Err(NetError::ConfigDir(_))
         ));
+    }
+
+    #[test]
+    fn cache_dir_branches() {
+        let p = |os, pairs| cache_dir_for(os, env_of(pairs)).unwrap();
+        assert_eq!(
+            p(
+                ConfigOs::MacOs,
+                &[("MACWIN_CACHE_DIR", "/c"), ("MACWIN_CONFIG_DIR", "/x")]
+            ),
+            PathBuf::from("/c")
+        );
+        assert_eq!(
+            p(ConfigOs::MacOs, &[("MACWIN_CONFIG_DIR", "/x")]),
+            PathBuf::from("/x/cache")
+        );
+        assert_eq!(
+            p(ConfigOs::MacOs, &[("HOME", "/Users/u")]),
+            PathBuf::from("/Users/u/Library/Caches/macwin")
+        );
+        assert_eq!(
+            p(ConfigOs::Windows, &[("LOCALAPPDATA", "C:\\L")]),
+            PathBuf::from("C:\\L").join("macwin")
+        );
+        assert_eq!(
+            p(ConfigOs::OtherUnix, &[("HOME", "/h")]),
+            PathBuf::from("/h/.cache/macwin")
+        );
+        assert!(cache_dir_for(ConfigOs::Windows, env_of(&[("APPDATA", "x")])).is_err());
     }
 
     #[test]

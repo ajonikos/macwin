@@ -15,6 +15,8 @@ pub mod clipboard;
 pub mod config;
 pub mod identity_store;
 pub mod runner;
+pub mod sharing;
+pub mod transfer;
 
 /// The OS this binary runs on, if macwin supports it.
 pub fn host_os() -> Option<Os> {

@@ -1,14 +1,15 @@
 # macwin
 
 A software KVM for one Mac and one Windows PC on the same LAN: either
-machine's keyboard and mouse can drive both screens, and copied text is
-shared between them. File copy-paste is planned on top.
+machine's keyboard and mouse can drive both screens, and copied text,
+images and files are shared between them.
 
-**Status: Phase 1.** Pairing by a one-time code, the identity key in the
+**Status: Phase 2.** Pairing by a one-time code, the identity key in the
 macOS Keychain / Windows DPAPI, a config file and `macwin run` (keyboard,
-mouse and text clipboard sharing with automatic reconnects) are implemented
-and tested with fakes; the real OS backends still need testing on hardware.
-A UI and installers come in later phases.
+mouse with smooth trackpad scrolling, clipboard sharing of text, images and
+files, automatic reconnects) are implemented and tested with fakes; the real
+OS backends still need testing on hardware. A UI and installers come in
+later phases.
 
 ## Workspace
 
@@ -85,10 +86,28 @@ scripts/macos/run.sh run          # on the Mac
 ```
 
 Push the cursor over the shared edge to control the other machine; touch the
-other machine's own mouse or keyboard to take control back. Copied text
-appears on the other machine's clipboard. `run` reconnects by itself when the
-network drops or the other machine restarts; Ctrl+C stops it, and so does the
-emergency chord **Ctrl+Alt+Shift+Esc** (Control+Option+Shift+Esc on a Mac).
+other machine's own mouse or keyboard to take control back. Trackpad and
+Magic Mouse scrolling stays smooth on the PC. `run` reconnects by itself when
+the network drops or the other machine restarts; Ctrl+C stops it, and so does
+the emergency chord **Ctrl+Alt+Shift+Esc** (Control+Option+Shift+Esc on a Mac).
+
+What you copy appears on the other machine's clipboard:
+
+- **Text**, up to `clipboard-max-kb` (4 MiB by default).
+- **Images** (screenshots, pictures copied in a browser or an editor), as
+  PNG, up to 64 MiB.
+- **Files and folders** copied in Finder or Explorer, up to
+  `clipboard-files-max-mb` in total (512 MiB by default). They are sent
+  right away when copied and wait in the cache directory
+  (`~/Library/Caches/macwin/incoming`, Windows `%LOCALAPPDATA%\macwin\incoming`,
+  or `MACWIN_CACHE_DIR`); paste in Finder or Explorer copies them out. Only
+  the latest copy is kept there, across reconnects. A copy travels whole
+  or not at all: an unreadable item, a name with a backslash or more than
+  65 536 items keep it on this machine. Symlinks are skipped, and names
+  that Windows does not accept are adjusted (`a:b.txt` becomes `a_b.txt`).
+
+When a copy holds several kinds (Word and Excel put text and a picture),
+files win over text, and text over an image.
 
 ### Configuration
 
@@ -104,6 +123,9 @@ macwin config set listen 0.0.0.0:47800
 macwin config set remap off                # keep Ctrl and Cmd/Win as they are
 macwin config set clipboard off            # stop sharing the clipboard
 macwin config set clipboard-max-kb 4096    # largest shared text
+macwin config set clipboard-images off     # text and files only
+macwin config set clipboard-files off      # text and images only
+macwin config set clipboard-files-max-mb 2048  # largest shared copy of files
 macwin unpair                              # forget the peer
 ```
 
@@ -157,7 +179,9 @@ permissions and keychain access survive rebuilds.
 
 Known limits: windows of elevated (admin) Windows apps, the Windows lock
 screen and UAC prompts do not accept remote input yet; macOS Secure Input
-(password fields) hides keystrokes from macwin while active.
+(password fields) hides keystrokes from macwin while active. Copied files
+travel when they are copied, not when they are pasted, so a large copy
+takes a moment to become pasteable on the other machine.
 
 ## Security model
 
@@ -170,11 +194,14 @@ screen and UAC prompts do not accept remote input yet; macOS Secure Input
   and the key confirmation, so a man in the middle needs the code, and each
   attempt tests at most one guess.
 - The identity key lives in the Keychain / DPAPI (see above).
-- Clipboard: only plain text is shared, only while both machines enable it.
-  Content marked private by password managers (`org.nspasteboard.Concealed`
-  / `Transient`, Windows `ExcludeClipboardContentFromMonitorProcessing`,
-  `CanUploadToCloudClipboard = 0`) is never sent, and clipboard content is
-  never logged.
+- Clipboard: each kind (text, images, files) is shared only while both
+  machines enable it. Content marked private by password managers
+  (`org.nspasteboard.Concealed` / `Transient`, Windows
+  `ExcludeClipboardContentFromMonitorProcessing`,
+  `CanUploadToCloudClipboard = 0`) is never sent, and clipboard content and
+  file names are never logged. Received file paths are checked (no `..`,
+  absolute paths or drive letters) before anything is written, and files
+  are only ever written inside the cache directory.
 - Emergency chord: **Ctrl+Alt+Shift+Esc** (Control+Option+Shift+Esc on a Mac).
   Capture backends check it on physical keys before anything is swallowed, and
   it always returns local control.

@@ -13,8 +13,8 @@ use macwin_agent::driver::{
 use macwin_core::engine::{Timings, TransportRole};
 use macwin_core::msg::{ButtonMsg, Enter, InputMsg, KeyMsg};
 use macwin_core::types::{
-    CapturedEvent, GrabCommand, Hid, MouseButton, Os, Point, PointF, Rect, RoleKind, ScreenInfo,
-    Side,
+    CapturedEvent, GrabCommand, Hid, InjectCommand, MouseButton, Os, Point, PointF, Rect, RoleKind,
+    ScreenInfo, Side, WheelUnit,
 };
 use macwin_net::{Identity, Session, codes, connect, listen};
 use macwin_platform::testing::{
@@ -50,10 +50,17 @@ fn cfg(os: Os, name: &str, side: Side) -> SessionConfig {
     }
 }
 
-/// Clipboard sharing with a fast poll for tests.
-fn sharing(max_text_bytes: usize) -> Option<ClipboardSettings> {
+/// Clipboard sharing of every kind with a fast poll; `max` limits each
+/// kind. The staging directory lives as long as the test process.
+fn sharing(max: usize) -> Option<ClipboardSettings> {
+    let staging = tempfile::tempdir().unwrap().keep();
     Some(ClipboardSettings {
-        max_text_bytes,
+        max_text_bytes: max,
+        images: true,
+        max_image_bytes: max,
+        files: true,
+        max_files_bytes: max as u64,
+        staging,
         poll: Duration::from_millis(5),
     })
 }
@@ -224,6 +231,39 @@ async fn crossing_from_a_to_b_with_motion_and_remap() {
     })
     .await;
     assert_eq!(b.injector.unmatched_ups(), 0);
+    a.handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trackpad_scrolling_stays_in_pixels() {
+    let (a, b) = start().await;
+    a_controls_b(&a, &b).await;
+    let wheel = |dx, dy, unit| CapturedEvent::Wheel { dx, dy, unit };
+    assert!(!a.capture.emit(wheel(0, -7, WheelUnit::Pixel)));
+    assert!(!a.capture.emit(wheel(0, 120, WheelUnit::Notch120)));
+    let wheels = || {
+        b.injector
+            .commands()
+            .into_iter()
+            .filter(|c| matches!(c, InjectCommand::Wheel { .. }))
+            .collect::<Vec<_>>()
+    };
+    wait_until("both scrolls injected on B", || wheels().len() == 2).await;
+    assert_eq!(
+        wheels(),
+        [
+            InjectCommand::Wheel {
+                dx: 0,
+                dy: -7,
+                unit: WheelUnit::Pixel
+            },
+            InjectCommand::Wheel {
+                dx: 0,
+                dy: 120,
+                unit: WheelUnit::Notch120
+            },
+        ]
+    );
     a.handle.shutdown();
 }
 
@@ -431,8 +471,11 @@ async fn clipboard_text_crosses_both_ways_without_echo() {
     .await;
     settle().await;
     // Each side wrote exactly once: no echo, no loop.
-    assert_eq!(a.clipboard.writes(), vec!["привет с ПК".to_string()]);
-    assert_eq!(b.clipboard.writes(), vec!["hello from the mac".to_string()]);
+    assert_eq!(a.clipboard.text_writes(), vec!["привет с ПК".to_string()]);
+    assert_eq!(
+        b.clipboard.text_writes(),
+        vec!["hello from the mac".to_string()]
+    );
     // A clipboard manager re-copying the received text does not bounce it back.
     a.clipboard.recopy();
     settle().await;
@@ -441,11 +484,217 @@ async fn clipboard_text_crosses_both_ways_without_echo() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn clipboard_images_cross_both_ways() {
+    let (a, b) = start_with(
+        with_clipboard(mac_cfg(), 1024),
+        with_clipboard(win_cfg(), 1024),
+    )
+    .await;
+    a.clipboard.copy_image(b"\x89PNG fake screenshot");
+    wait_until("B got the image", || {
+        b.clipboard.image().as_deref() == Some(&b"\x89PNG fake screenshot"[..])
+    })
+    .await;
+    b.clipboard.copy_image(b"\x89PNG other");
+    wait_until("A got the image", || {
+        a.clipboard.image().as_deref() == Some(&b"\x89PNG other"[..])
+    })
+    .await;
+    settle().await;
+    assert_eq!(a.clipboard.writes().len(), 1);
+    assert_eq!(b.clipboard.writes().len(), 1);
+    a.handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_received_image_re_encoded_by_a_clipboard_manager_is_not_sent_back() {
+    let (a, b) = start_with(
+        with_clipboard(mac_cfg(), 4096),
+        with_clipboard(win_cfg(), 4096),
+    )
+    .await;
+    let (w, h) = (8u32, 8u32);
+    let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i * 5) as u8).collect();
+    let rgba = macwin_platform::image::Rgba {
+        width: w,
+        height: h,
+        pixels: rgb
+            .chunks_exact(3)
+            .flat_map(|c| [c[0], c[1], c[2], 255])
+            .collect(),
+    };
+    let png = macwin_platform::image::encode_png(&rgba).unwrap();
+    a.clipboard.copy_image(&png);
+    wait_until("B got the image", || {
+        b.clipboard.image().as_deref() == Some(&png[..])
+    })
+    .await;
+    // B's clipboard manager puts the same picture back as an RGB PNG.
+    let mut rgb_png = Vec::new();
+    let mut e = png::Encoder::new(&mut rgb_png, w, h);
+    e.set_color(png::ColorType::Rgb);
+    e.set_depth(png::BitDepth::Eight);
+    e.write_header().unwrap().write_image_data(&rgb).unwrap();
+    assert_ne!(rgb_png, png);
+    b.clipboard.copy_image(&rgb_png);
+    settle().await;
+    assert!(a.clipboard.writes().is_empty(), "the image bounced back");
+    a.handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn copied_files_arrive_on_the_other_clipboard() {
+    let (a, b) = start_with(
+        with_clipboard(mac_cfg(), 1 << 20),
+        with_clipboard(win_cfg(), 1 << 20),
+    )
+    .await;
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(src.path().join("Отчёт/img")).unwrap();
+    std::fs::write(src.path().join("Отчёт/readme.txt"), b"hello").unwrap();
+    std::fs::write(src.path().join("Отчёт/img/a.bin"), vec![3u8; 200_000]).unwrap();
+    std::fs::write(src.path().join("notes.md"), b"# notes").unwrap();
+    a.clipboard
+        .copy_files(&[src.path().join("Отчёт"), src.path().join("notes.md")]);
+    wait_until("B has files on its clipboard", || {
+        b.clipboard.files().is_some()
+    })
+    .await;
+    let files = b.clipboard.files().unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(
+        files[0].ends_with("Отчёт") && files[1].ends_with("notes.md"),
+        "{files:?}"
+    );
+    assert_eq!(
+        std::fs::read(files[0].join("readme.txt")).unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        std::fs::read(files[0].join("img/a.bin")).unwrap(),
+        vec![3u8; 200_000]
+    );
+    assert_eq!(std::fs::read(&files[1]).unwrap(), b"# notes");
+    // A clipboard manager re-copying the received files does not send them back.
+    b.clipboard.recopy();
+    settle().await;
+    assert!(
+        a.clipboard.writes().is_empty(),
+        "{:?}",
+        a.clipboard.writes()
+    );
+    // A newer copy replaces the staged files on the next transfer.
+    std::fs::write(src.path().join("second.txt"), b"2").unwrap();
+    a.clipboard.copy_files(&[src.path().join("second.txt")]);
+    wait_until("B got the second transfer", || {
+        b.clipboard
+            .files()
+            .is_some_and(|f| f.len() == 1 && f[0].ends_with("second.txt"))
+    })
+    .await;
+    wait_until("the previous transfer was cleaned up", || {
+        !files[0].exists()
+    })
+    .await;
+    a.handle.shutdown();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn copying_again_after_a_failed_send_sends_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let (a, b) = start_with(
+        with_clipboard(mac_cfg(), 1 << 20),
+        with_clipboard(win_cfg(), 1 << 20),
+    )
+    .await;
+    let src = tempfile::tempdir().unwrap();
+    let file = src.path().join("locked.txt");
+    std::fs::write(&file, b"secret plans").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&file).is_ok() {
+        return; // running as root: permissions do not stop reads
+    }
+    a.clipboard.copy_files(std::slice::from_ref(&file));
+    settle().await;
+    assert!(b.clipboard.writes().is_empty());
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    a.clipboard.recopy();
+    wait_until("B got the files", || b.clipboard.files().is_some()).await;
+    let files = b.clipboard.files().unwrap();
+    assert_eq!(std::fs::read(&files[0]).unwrap(), b"secret plans");
+    a.handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn received_files_stay_pasteable_after_a_reconnect() {
+    let a_cfg = with_clipboard(mac_cfg(), 1 << 20);
+    let b_cfg = with_clipboard(win_cfg(), 1 << 20);
+    let (a, b) = start_with(a_cfg.clone(), b_cfg.clone()).await;
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("keep.txt"), b"kept").unwrap();
+    a.clipboard.copy_files(&[src.path().join("keep.txt")]);
+    wait_until("B has the files", || b.clipboard.files().is_some()).await;
+    let pasted = b.clipboard.files().unwrap();
+    a.handle.shutdown();
+    assert_eq!(b.handle.join().await, SessionEnd::PeerClosed);
+    // The same machines connect again (same staging directories).
+    let (_a2, _b2) = start_with(a_cfg, b_cfg).await;
+    settle().await;
+    assert_eq!(std::fs::read(&pasted[0]).unwrap(), b"kept");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_newer_copy_overrides_files_still_arriving() {
+    let b_cfg = with_clipboard(win_cfg(), 64 << 20);
+    let staging = b_cfg.clipboard.as_ref().unwrap().staging.clone();
+    let (a, b) = start_with(with_clipboard(mac_cfg(), 64 << 20), b_cfg).await;
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("big.bin"), vec![1u8; 48 << 20]).unwrap();
+    a.clipboard.copy_files(&[src.path().join("big.bin")]);
+    // The user copies text on B while the files are still arriving.
+    wait_until("B started receiving", || {
+        std::fs::read_dir(&staging).is_ok_and(|mut d| d.next().is_some())
+    })
+    .await;
+    b.clipboard.copy_text("newer");
+    wait_until("A got the text", || {
+        a.clipboard.text().as_deref() == Some("newer")
+    })
+    .await;
+    settle().await;
+    assert!(
+        b.clipboard.writes().is_empty(),
+        "the overtaken files were not put on the clipboard"
+    );
+    wait_until("the partial transfer was removed", || {
+        std::fs::read_dir(&staging).map_or(true, |d| d.count() == 0)
+    })
+    .await;
+    a.handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_over_the_limit_are_not_sent() {
+    let (a, b) = start_with(
+        with_clipboard(mac_cfg(), 100),
+        with_clipboard(win_cfg(), 100),
+    )
+    .await;
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("big.bin"), vec![0u8; 1000]).unwrap();
+    a.clipboard.copy_files(&[src.path().join("big.bin")]);
+    settle().await;
+    assert!(b.clipboard.writes().is_empty());
+    a.handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn private_large_and_non_text_content_is_not_shared() {
     let (a, b) = start_with(with_clipboard(mac_cfg(), 8), with_clipboard(win_cfg(), 8)).await;
     a.clipboard.copy_sensitive("hunter2");
     a.clipboard.copy_text("way over the 8-byte limit");
-    a.clipboard.copy_image();
+    a.clipboard.copy_image(b"an image over the limit");
     settle().await;
     assert!(
         b.clipboard.writes().is_empty(),
@@ -468,7 +717,7 @@ async fn no_clipboard_sharing_unless_both_sides_enable_it() {
     b.clipboard.copy_text("stays on the pc");
     settle().await;
     assert!(a.clipboard.writes().is_empty() && b.clipboard.writes().is_empty());
-    assert_eq!(a.clipboard.text_reads(), 0, "A never read its clipboard");
+    assert_eq!(a.clipboard.content_reads(), 0, "A never read its clipboard");
     a.handle.shutdown();
 }
 

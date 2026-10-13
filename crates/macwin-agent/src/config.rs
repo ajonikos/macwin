@@ -24,6 +24,11 @@ pub const MAX_CLIPBOARD_MAX_KB: u32 = (macwin_proto::MAX_CLIPBOARD_TEXT / 1024) 
 const HEADER: &str = "# macwin configuration. Change it with `macwin config set KEY VALUE`,\n\
                       # or edit it while macwin is not running.\n\n";
 
+/// Default limit of shared copied files, in MiB.
+pub const DEFAULT_FILES_MAX_MB: u32 = 512;
+/// Largest configurable file limit (the protocol's 64 GiB).
+pub const MAX_FILES_MAX_MB: u32 = 65_536;
+
 /// Validated configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -40,11 +45,21 @@ pub struct ClipboardConfig {
     pub enabled: bool,
     /// Texts above this many KiB are not shared.
     pub max_text_kb: u32,
+    /// Share images.
+    pub images: bool,
+    /// Share copied files.
+    pub files: bool,
+    /// Copied files above this many MiB in total are not shared.
+    pub max_files_mb: u32,
 }
 
 impl ClipboardConfig {
     pub fn max_text_bytes(&self) -> usize {
         self.max_text_kb as usize * 1024
+    }
+
+    pub fn max_files_bytes(&self) -> u64 {
+        u64::from(self.max_files_mb) * 1024 * 1024
     }
 }
 
@@ -68,6 +83,9 @@ impl Default for Config {
             clipboard: ClipboardConfig {
                 enabled: true,
                 max_text_kb: DEFAULT_CLIPBOARD_MAX_KB,
+                images: true,
+                files: true,
+                max_files_mb: DEFAULT_FILES_MAX_MB,
             },
             peer: None,
         }
@@ -89,6 +107,9 @@ struct RawConfig {
 struct RawClipboard {
     enabled: bool,
     max_text_kb: u32,
+    images: bool,
+    files: bool,
+    max_files_mb: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -177,6 +198,14 @@ fn check_max_kb(kb: u32) -> anyhow::Result<u32> {
     }
 }
 
+fn check_max_mb(mb: u32) -> anyhow::Result<u32> {
+    if (1..=MAX_FILES_MAX_MB).contains(&mb) {
+        Ok(mb)
+    } else {
+        bail!("clipboard.max_files_mb: expected 1..={MAX_FILES_MAX_MB}, got {mb}")
+    }
+}
+
 fn parse_bool(key: &str, v: &str) -> anyhow::Result<bool> {
     match v {
         "on" | "true" | "yes" | "1" => Ok(true),
@@ -193,6 +222,9 @@ impl From<&Config> for RawConfig {
             clipboard: RawClipboard {
                 enabled: c.clipboard.enabled,
                 max_text_kb: c.clipboard.max_text_kb,
+                images: c.clipboard.images,
+                files: c.clipboard.files,
+                max_files_mb: c.clipboard.max_files_mb,
             },
             peer: c.peer.as_ref().map(|p| RawPeer {
                 fingerprint: p.fingerprint.to_string(),
@@ -242,6 +274,9 @@ impl TryFrom<RawConfig> for Config {
             clipboard: ClipboardConfig {
                 enabled: r.clipboard.enabled,
                 max_text_kb: check_max_kb(r.clipboard.max_text_kb)?,
+                images: r.clipboard.images,
+                files: r.clipboard.files,
+                max_files_mb: check_max_mb(r.clipboard.max_files_mb)?,
             },
             peer,
         })
@@ -320,8 +355,17 @@ impl Config {
                     .map_err(|_| anyhow!("clipboard-max-kb: expected a number, got {value:?}"))?;
                 self.clipboard.max_text_kb = check_max_kb(kb)?;
             }
+            "clipboard-images" => self.clipboard.images = parse_bool(key, value)?,
+            "clipboard-files" => self.clipboard.files = parse_bool(key, value)?,
+            "clipboard-files-max-mb" => {
+                let mb = value.parse().map_err(|_| {
+                    anyhow!("clipboard-files-max-mb: expected a number, got {value:?}")
+                })?;
+                self.clipboard.max_files_mb = check_max_mb(mb)?;
+            }
             _ => bail!(
-                "unknown key {key:?}; keys: side, address, listen, remap, clipboard, clipboard-max-kb"
+                "unknown key {key:?}; keys: side, address, listen, remap, clipboard, \
+                 clipboard-max-kb, clipboard-images, clipboard-files, clipboard-files-max-mb"
             ),
         }
         Ok(())
@@ -452,6 +496,13 @@ mod tests {
         assert!(!c.remap && !c.clipboard.enabled);
         assert_eq!(c.clipboard.max_text_kb, 64);
         assert!(c.set("clipboard-max-kb", "0").is_err());
+        c.set("clipboard-images", "off").unwrap();
+        c.set("clipboard-files", "off").unwrap();
+        c.set("clipboard-files-max-mb", "100").unwrap();
+        assert!(!c.clipboard.images && !c.clipboard.files);
+        assert_eq!(c.clipboard.max_files_bytes(), 100 * 1024 * 1024);
+        assert!(c.set("clipboard-files-max-mb", "0").is_err());
+        assert!(c.set("clipboard-files-max-mb", "70000").is_err());
         assert!(c.set("remap", "maybe").is_err());
         assert!(c.set("colour", "red").is_err());
         let mut p = paired();

@@ -26,6 +26,13 @@ pub const CAP_INPUT_INJECT: &str = "input.inject";
 pub const CAP_SPIKE_NET: &str = "spike.net";
 /// The sender sends and accepts plain-text clipboard updates.
 pub const CAP_CLIPBOARD_TEXT: &str = "clipboard.text";
+/// The sender sends and accepts clipboard images (PNG).
+pub const CAP_CLIPBOARD_IMAGE: &str = "clipboard.image";
+/// The sender sends and accepts copied files.
+pub const CAP_CLIPBOARD_FILES: &str = "clipboard.files";
+/// The sender injects pixel wheel deltas (smooth scrolling); peers without
+/// it get whole-notch units instead.
+pub const CAP_WHEEL_PIXEL: &str = "input.wheel-pixel";
 
 /// Messages on the control stream.
 #[derive(Debug, Clone, PartialEq)]
@@ -158,14 +165,75 @@ pub struct MouseAbs {
 }
 
 /// Messages on clipboard streams (exactly one per unidirectional stream).
+/// Copied files travel separately, as a [`FilesHeader`] followed by their
+/// data on a stream of their own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardMsg {
     Text(ClipboardText),
+    Image(ClipboardImage),
     /// The sender's clipboard changed to something macwin does not share
-    /// (an image, files, a password, too much text). Carries no content.
+    /// (a password, too much data, a kind the receiver does not accept).
+    /// Carries no content.
     Other {
         clock: u64,
     },
+}
+
+impl ClipboardMsg {
+    pub fn clock(&self) -> u64 {
+        match self {
+            ClipboardMsg::Text(t) => t.clock,
+            ClipboardMsg::Image(i) => i.clock,
+            ClipboardMsg::Other { clock } => *clock,
+        }
+    }
+}
+
+/// The sender's clipboard now holds an image.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClipboardImage {
+    pub clock: u64,
+    /// PNG-encoded.
+    pub png: Vec<u8>,
+}
+
+/// Never prints the content, only its size.
+impl fmt::Debug for ClipboardImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClipboardImage")
+            .field("clock", &self.clock)
+            .field("bytes", &self.png.len())
+            .finish()
+    }
+}
+
+/// First frame of a files stream: what follows, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesHeader {
+    /// Lamport clock of the clipboard change (see [`crate::clipboard`]).
+    pub clock: u64,
+    pub entries: Vec<FileEntry>,
+}
+
+impl FilesHeader {
+    /// Bytes of file data that follow the header.
+    pub fn total_bytes(&self) -> u64 {
+        self.entries.iter().map(|e| e.size).sum()
+    }
+}
+
+/// One file or directory of a transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    /// Relative, `/`-separated; the first component is a top-level item.
+    pub path: String,
+    /// Bytes of data that follow for this entry (0 for directories).
+    pub size: u64,
+    pub dir: bool,
+    /// The source had an execute bit (Unix).
+    pub executable: bool,
+    /// Modification time in milliseconds since the Unix epoch, 0 if unknown.
+    pub mtime_ms: i64,
 }
 
 /// The sender's clipboard now holds `text`.

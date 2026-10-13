@@ -10,19 +10,35 @@ mod convert;
 pub mod frame;
 pub mod wire;
 
-use macwin_core::msg::{ClipboardMsg, ControlMsg, DatagramMsg, InputMsg, PairMsg};
+use macwin_core::msg::{ClipboardMsg, ControlMsg, DatagramMsg, FilesHeader, InputMsg, PairMsg};
 use prost::Message;
 
+pub use convert::check_relative_path;
+
 /// `major << 16 | minor`. Peers with a different major refuse each other.
-/// Minor 1 added clipboard streams (capability `clipboard.text`) and pairing.
-pub const PROTOCOL_VERSION: u32 = 0x0001_0001;
+/// Minor 1 added clipboard streams (capability `clipboard.text`) and
+/// pairing; minor 2 clipboard images and files (`clipboard.image`,
+/// `clipboard.files`) and pixel wheel deltas (`input.wheel-pixel`).
+pub const PROTOCOL_VERSION: u32 = 0x0001_0002;
 /// Largest frame body on the control and input streams, the pairing stream
 /// and in datagrams.
 pub const MAX_FRAME_LEN: usize = 64 * 1024;
 /// Largest clipboard text accepted on the wire, in UTF-8 bytes.
 pub const MAX_CLIPBOARD_TEXT: usize = 16 * 1024 * 1024;
-/// Largest encoded [`ClipboardMsg`] (the text plus protobuf overhead).
-pub const MAX_CLIPBOARD_FRAME: usize = MAX_CLIPBOARD_TEXT + 64;
+/// Largest clipboard image (PNG) accepted on the wire.
+pub const MAX_CLIPBOARD_IMAGE: usize = 64 * 1024 * 1024;
+/// Largest encoded [`ClipboardMsg`] (the content plus protobuf overhead).
+pub const MAX_CLIPBOARD_FRAME: usize = MAX_CLIPBOARD_IMAGE + 64;
+/// Largest encoded [`FilesHeader`].
+pub const MAX_FILES_HEADER: usize = 16 * 1024 * 1024;
+/// Most entries in one file transfer.
+pub const MAX_FILE_ENTRIES: usize = 65_536;
+/// Longest relative path of a file entry, in bytes.
+pub const MAX_FILE_PATH_LEN: usize = 4096;
+/// Deepest nesting of a file entry.
+pub const MAX_FILE_DEPTH: usize = 64;
+/// Most file data in one transfer.
+pub const MAX_FILES_TOTAL: u64 = 64 * 1024 * 1024 * 1024;
 /// Length of a SPAKE2 (Ed25519) message.
 pub const SPAKE_MSG_LEN: usize = 33;
 /// Length of a pairing key-confirmation MAC (HMAC-SHA256).
@@ -107,8 +123,67 @@ pub fn encode_clipboard(m: &ClipboardMsg) -> Vec<u8> {
 pub fn clipboard_within_limits(m: &ClipboardMsg) -> bool {
     match m {
         ClipboardMsg::Text(t) => t.text.len() <= MAX_CLIPBOARD_TEXT,
+        ClipboardMsg::Image(i) => i.png.len() <= MAX_CLIPBOARD_IMAGE,
         ClipboardMsg::Other { .. } => true,
     }
+}
+
+pub fn encode_files_header(h: &FilesHeader) -> Vec<u8> {
+    convert::files_header_to_wire(h).encode_to_vec()
+}
+
+/// Decodes and validates a files header: relative paths that stay inside
+/// the receiving directory, no duplicates, bounded counts and sizes.
+pub fn decode_files_header(b: &[u8]) -> Result<FilesHeader, ProtoError> {
+    if b.len() > MAX_FILES_HEADER {
+        return Err(ProtoError::InvalidValue {
+            field: "files header",
+            reason: "header larger than 16 MiB",
+        });
+    }
+    count_entries(b)?;
+    convert::files_header_from_wire(wire::FilesHeader::decode(b)?)
+}
+
+/// Counts the entries of an encoded files header without decoding them and
+/// fails beyond [`MAX_FILE_ENTRIES`]: a decoded entry takes about 25 times
+/// the 2 bytes of the smallest encoding, so a header packed with empty
+/// entries must be refused before it is expanded.
+fn count_entries(mut b: &[u8]) -> Result<usize, ProtoError> {
+    use prost::encoding::{WireType, decode_key, decode_varint};
+    let malformed = || ProtoError::InvalidValue {
+        field: "files header",
+        reason: "malformed",
+    };
+    let mut entries = 0;
+    while !b.is_empty() {
+        let (tag, wire_type) = decode_key(&mut b)?;
+        let skip = match wire_type {
+            WireType::Varint => {
+                decode_varint(&mut b)?;
+                0
+            }
+            WireType::SixtyFourBit => 8,
+            WireType::ThirtyTwoBit => 4,
+            WireType::LengthDelimited => decode_varint(&mut b)?,
+            WireType::StartGroup | WireType::EndGroup => return Err(malformed()),
+        };
+        let skip = usize::try_from(skip)
+            .ok()
+            .filter(|s| *s <= b.len())
+            .ok_or_else(malformed)?;
+        b = &b[skip..];
+        if tag == 2 {
+            entries += 1;
+            if entries > MAX_FILE_ENTRIES {
+                return Err(ProtoError::InvalidValue {
+                    field: "files_header.entries",
+                    reason: "more than 65536 entries",
+                });
+            }
+        }
+    }
+    Ok(entries)
 }
 
 pub fn decode_clipboard(b: &[u8]) -> Result<ClipboardMsg, ProtoError> {

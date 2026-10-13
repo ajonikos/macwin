@@ -1,7 +1,9 @@
 //! CGEvent -> `CapturedEvent` conversion.
 
 use macwin_core::keymap::mac_to_hid;
-use macwin_core::os::macos::{FlagsChange, KVK_CAPS_LOCK, flags_changed, scroll_from_fixed};
+use macwin_core::os::macos::{
+    FlagsChange, KVK_CAPS_LOCK, flags_changed, scroll_from_fixed, scroll_from_points,
+};
 use macwin_core::types::{CapturedEvent, MouseButton, PointF, WheelUnit};
 use objc2_core_graphics::{CGEvent, CGEventField, CGEventMask, CGEventType};
 
@@ -80,16 +82,23 @@ pub(crate) fn convert(t: CGEventType, e: &CGEvent, out: &mut Vec<CapturedEvent>)
             }
         }
         CGEventType::ScrollWheel => {
-            let (dx, dy) = scroll_from_fixed(
-                double(e, CGEventField::ScrollWheelEventFixedPtDeltaAxis1),
-                double(e, CGEventField::ScrollWheelEventFixedPtDeltaAxis2),
-            );
+            // Trackpads and the Magic Mouse scroll continuously, in pixels
+            // (momentum included); wheels in lines.
+            let (dx, dy, unit) = if int(e, CGEventField::ScrollWheelEventIsContinuous) != 0 {
+                let (dx, dy) = scroll_from_points(
+                    int(e, CGEventField::ScrollWheelEventPointDeltaAxis1),
+                    int(e, CGEventField::ScrollWheelEventPointDeltaAxis2),
+                );
+                (dx, dy, WheelUnit::Pixel)
+            } else {
+                let (dx, dy) = scroll_from_fixed(
+                    double(e, CGEventField::ScrollWheelEventFixedPtDeltaAxis1),
+                    double(e, CGEventField::ScrollWheelEventFixedPtDeltaAxis2),
+                );
+                (dx, dy, WheelUnit::Notch120)
+            };
             if dx != 0 || dy != 0 {
-                out.push(CapturedEvent::Wheel {
-                    dx,
-                    dy,
-                    unit: WheelUnit::Notch120,
-                });
+                out.push(CapturedEvent::Wheel { dx, dy, unit });
             }
         }
         CGEventType::KeyDown | CGEventType::KeyUp => {
@@ -260,12 +269,28 @@ mod tests {
     fn scroll_lines_become_notch_units() {
         let e =
             CGEvent::new_scroll_wheel_event2(None, CGScrollEventUnit::Line, 1, 1, 0, 0).unwrap();
+        CGEvent::set_integer_value_field(Some(&e), CGEventField::ScrollWheelEventIsContinuous, 0);
         assert_eq!(
             converted(CGEventType::ScrollWheel, &e),
             vec![CapturedEvent::Wheel {
                 dx: 0,
                 dy: 120,
                 unit: WheelUnit::Notch120
+            }]
+        );
+    }
+
+    #[test]
+    fn continuous_scrolls_stay_in_pixels() {
+        let e =
+            CGEvent::new_scroll_wheel_event2(None, CGScrollEventUnit::Pixel, 2, -7, 3, 0).unwrap();
+        CGEvent::set_integer_value_field(Some(&e), CGEventField::ScrollWheelEventIsContinuous, 1);
+        assert_eq!(
+            converted(CGEventType::ScrollWheel, &e),
+            vec![CapturedEvent::Wheel {
+                dx: -3,
+                dy: -7,
+                unit: WheelUnit::Pixel
             }]
         );
     }

@@ -383,6 +383,56 @@ fn remapped_forwarding_and_repeat_detection() {
     );
 }
 
+#[test]
+fn pixel_scrolling_reaches_peers_that_take_it_and_whole_units_otherwise() {
+    let t0 = Instant::now();
+    let pixels = |dx, dy| CapturedEvent::Wheel {
+        dx,
+        dy,
+        unit: WheelUnit::Pixel,
+    };
+    let sent = |dx, dy, unit| {
+        swallowed(vec![Action::SendInput(InputMsg::Wheel(WheelMsg {
+            dx,
+            dy,
+            unit,
+        }))])
+    };
+    // The default peer predates pixel scrolling: 40 px make one notch.
+    let mut old = mac_controlling(t0);
+    assert_eq!(
+        old.on_local_event(t0, pixels(-2, 40)),
+        sent(-6, 120, WheelUnit::Notch120)
+    );
+    let mut new = engine_with(Os::MacOs, mac_screens(), Side::Right, true);
+    new.on_connected(
+        t0,
+        peer_with(
+            Os::Windows,
+            win_screens(1.0),
+            &[CAP_INPUT_CAPTURE, CAP_INPUT_INJECT, CAP_WHEEL_PIXEL],
+        ),
+        TransportRole::Dialer,
+    );
+    new.on_local_event(t0, mv(1439.5, 450.0));
+    assert_eq!(new.role(), RoleKind::Controlling);
+    assert_eq!(
+        new.on_local_event(t0, pixels(-2, 40)),
+        sent(-2, 40, WheelUnit::Pixel)
+    );
+    assert_eq!(
+        new.on_local_event(
+            t0,
+            CapturedEvent::Wheel {
+                dx: 0,
+                dy: -120,
+                unit: WheelUnit::Notch120
+            }
+        ),
+        sent(0, -120, WheelUnit::Notch120)
+    );
+}
+
 // 7
 #[test]
 fn pre_grab_and_held_from_remote_semantics() {
@@ -544,7 +594,11 @@ fn target_inject_then_release_on_leave_in_exact_order() {
                 unit: WheelUnit::Pixel
             })
         ),
-        vec![]
+        vec![Action::Inject(InjectCommand::Wheel {
+            dx: 0,
+            dy: 3,
+            unit: WheelUnit::Pixel
+        })]
     );
     assert_eq!(
         w.on_input(t0, InputMsg::Leave(Leave { epoch: 1 })),

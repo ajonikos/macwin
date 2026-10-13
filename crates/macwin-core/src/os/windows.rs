@@ -1,8 +1,9 @@
 //! Windows conversions: scan codes, injection codes and absolute mouse
 //! coordinates.
 
+use super::pixels_to_notch120;
 use crate::keymap;
-use crate::types::{Hid, MouseButton};
+use crate::types::{Hid, MouseButton, WheelUnit};
 
 /// `XBUTTON1` (the Back button) in `MOUSEINPUT::mouseData`.
 pub const XBUTTON1: u32 = 1;
@@ -141,9 +142,26 @@ pub fn normalize_absolute(x: i32, v_left: i32, v_width: i32) -> i32 {
     n.clamp(0, 65_535) as i32
 }
 
+/// A wheel delta in `MOUSEINPUT::mouseData` units: 120 per notch, smaller
+/// values scroll smoothly in apps that support high-resolution wheels.
+pub fn wheel_data(delta: i32, unit: WheelUnit) -> i32 {
+    match unit {
+        WheelUnit::Notch120 => delta,
+        WheelUnit::Pixel => pixels_to_notch120(delta),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_data_scales_pixels() {
+        assert_eq!(wheel_data(-120, WheelUnit::Notch120), -120);
+        assert_eq!(wheel_data(40, WheelUnit::Pixel), 120, "a notch of pixels");
+        assert_eq!(wheel_data(-1, WheelUnit::Pixel), -3);
+        assert_eq!(wheel_data(i32::MAX, WheelUnit::Pixel), i32::MAX);
+    }
 
     #[test]
     fn scan_codes() {

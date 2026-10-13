@@ -82,7 +82,7 @@ pub mod datagram_frame {
 /// prefix: the stream ends where the message ends).
 #[derive(Clone, PartialEq, Message)]
 pub struct ClipboardFrame {
-    #[prost(oneof = "clipboard_frame::Kind", tags = "1, 2")]
+    #[prost(oneof = "clipboard_frame::Kind", tags = "1, 2, 3")]
     pub kind: Option<clipboard_frame::Kind>,
 }
 
@@ -93,7 +93,40 @@ pub mod clipboard_frame {
         Text(super::ClipboardText),
         #[prost(message, tag = "2")]
         Other(super::ClipboardOther),
+        #[prost(message, tag = "3")]
+        Image(super::ClipboardImage),
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClipboardImage {
+    #[prost(uint64, tag = "1")]
+    pub clock: u64,
+    #[prost(bytes = "vec", tag = "2")]
+    pub png: Vec<u8>,
+}
+
+/// First frame of a files stream (length-prefixed), followed by raw data.
+#[derive(Clone, PartialEq, Message)]
+pub struct FilesHeader {
+    #[prost(uint64, tag = "1")]
+    pub clock: u64,
+    #[prost(message, repeated, tag = "2")]
+    pub entries: Vec<FileEntry>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FileEntry {
+    #[prost(string, tag = "1")]
+    pub path: String,
+    #[prost(uint64, tag = "2")]
+    pub size: u64,
+    #[prost(bool, tag = "3")]
+    pub dir: bool,
+    #[prost(bool, tag = "4")]
+    pub executable: bool,
+    #[prost(sint64, tag = "5")]
+    pub mtime_ms: i64,
 }
 
 #[derive(Clone, Copy, PartialEq, Message)]
