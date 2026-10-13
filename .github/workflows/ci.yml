@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml pins 1.96.0; install it explicitly with the components CI needs.
+      - name: Install Rust 1.96.0
+        run: rustup toolchain install 1.96.0 --profile minimal -c rustfmt,clippy
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+      - name: Generated keymap is up to date
+        run: cargo run -p keymap-gen --locked -- --check
+
+  # cargo-deny-action is a Docker action and only runs on Linux; deny.toml's
+  # [graph] targets make it check the macOS and Windows dependency graphs.
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2.0.20
+        with:
+          command: check
+          rust-version: "1.96.0"

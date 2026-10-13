@@ -1,0 +1,42 @@
+[package]
+name = "macwin-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "macwin_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "macwin"
+path = "src/main.rs"
+
+[features]
+default = ["private-cursor-api"]
+private-cursor-api = ["macwin-platform-macos/private-cursor-api"]
+
+[dependencies]
+macwin-core = { workspace = true }
+macwin-proto = { workspace = true }
+macwin-net = { workspace = true }
+macwin-platform = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+macwin-platform-macos = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+macwin-platform-windows = { workspace = true }
+
+[dev-dependencies]
+macwin-platform = { workspace = true, features = ["testing"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

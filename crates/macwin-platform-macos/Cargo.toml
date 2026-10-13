@@ -1,0 +1,27 @@
+[package]
+name = "macwin-platform-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Links the private `_CGSDefaultConnection` / `CGSSetConnectionProperty` cursor API.
+private-cursor-api = []
+
+[dependencies]
+macwin-core = { workspace = true }
+macwin-platform = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true }
+objc2-core-foundation = { workspace = true }
+objc2-core-graphics = { workspace = true }
+objc2-foundation = { workspace = true }
+
+[lints]
+workspace = true

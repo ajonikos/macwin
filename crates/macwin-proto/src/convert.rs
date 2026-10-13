@@ -1,0 +1,387 @@
+//! Domain <-> wire conversion. Encoding is infallible; decoding validates
+//! every field ("parse, don't validate"), so the rest of macwin only ever
+//! sees well-formed domain values.
+
+use macwin_core::geometry::ScreenSet;
+use macwin_core::msg::{
+    ButtonMsg, ControlMsg, DatagramMsg, Enter, Heartbeat, Hello, InputMsg, KeyMsg, Leave, MouseAbs,
+    Ping, Pong, TakeControl, WheelMsg,
+};
+use macwin_core::types::{
+    GeometryError, Hid, ModifierMask, MouseButton, Os, Point, Rect, RoleKind, ScreenInfo, Side,
+    WheelUnit,
+};
+
+use crate::wire::{self, control_frame, datagram_frame, input_frame};
+use crate::{MAX_CAPABILITIES, MAX_CAPABILITY_LEN, MAX_STRING_LEN, ProtoError};
+
+// ---------- domain -> wire ----------
+
+fn point_to_wire(p: Point) -> wire::Point {
+    wire::Point { x: p.x, y: p.y }
+}
+
+fn os_to_wire(os: Os) -> wire::Os {
+    match os {
+        Os::MacOs => wire::Os::Macos,
+        Os::Windows => wire::Os::Windows,
+    }
+}
+
+fn side_to_wire(side: Option<Side>) -> wire::Side {
+    match side {
+        None => wire::Side::Unspecified,
+        Some(Side::Left) => wire::Side::Left,
+        Some(Side::Right) => wire::Side::Right,
+    }
+}
+
+fn role_to_wire(role: RoleKind) -> wire::Role {
+    match role {
+        RoleKind::Idle => wire::Role::Idle,
+        RoleKind::Controlling => wire::Role::Controlling,
+        RoleKind::Controlled => wire::Role::Controlled,
+    }
+}
+
+fn button_to_wire(b: MouseButton) -> wire::MouseButton {
+    match b {
+        MouseButton::Left => wire::MouseButton::Left,
+        MouseButton::Right => wire::MouseButton::Right,
+        MouseButton::Middle => wire::MouseButton::Middle,
+        MouseButton::Back => wire::MouseButton::Back,
+        MouseButton::Forward => wire::MouseButton::Forward,
+    }
+}
+
+fn unit_to_wire(u: WheelUnit) -> wire::WheelUnit {
+    match u {
+        WheelUnit::Notch120 => wire::WheelUnit::Notch120,
+        WheelUnit::Pixel => wire::WheelUnit::Pixel,
+    }
+}
+
+fn ping_to_wire(p: Ping) -> wire::Ping {
+    wire::Ping {
+        id: p.id,
+        sent_micros: p.sent_micros,
+    }
+}
+
+fn pong_to_wire(p: Pong) -> wire::Pong {
+    wire::Pong {
+        id: p.id,
+        ping_sent_micros: p.ping_sent_micros,
+    }
+}
+
+fn hello_to_wire(h: &Hello) -> wire::Hello {
+    wire::Hello {
+        protocol_version: h.protocol_version,
+        capabilities: h.capabilities.clone(),
+        os: os_to_wire(h.os) as i32,
+        os_version: h.os_version.clone(),
+        device_name: h.device_name.clone(),
+        screens: h
+            .screens
+            .iter()
+            .map(|s| wire::Screen {
+                id: s.id,
+                x: s.rect.left(),
+                y: s.rect.top(),
+                w: s.rect.width().unsigned_abs(),
+                h: s.rect.height().unsigned_abs(),
+                native_per_logical: s.native_per_logical,
+                primary: s.primary,
+            })
+            .collect(),
+        peer_side: side_to_wire(h.peer_side) as i32,
+        agent_version: h.agent_version.clone(),
+    }
+}
+
+pub(crate) fn control_to_wire(m: &ControlMsg) -> wire::ControlFrame {
+    let kind = match m {
+        ControlMsg::Hello(h) => control_frame::Kind::Hello(hello_to_wire(h)),
+        ControlMsg::Heartbeat(hb) => control_frame::Kind::Heartbeat(wire::Heartbeat {
+            epoch: hb.epoch,
+            role: role_to_wire(hb.role) as i32,
+        }),
+        ControlMsg::Ping(p) => control_frame::Kind::Ping(ping_to_wire(*p)),
+        ControlMsg::Pong(p) => control_frame::Kind::Pong(pong_to_wire(*p)),
+    };
+    wire::ControlFrame { kind: Some(kind) }
+}
+
+pub(crate) fn input_to_wire(m: &InputMsg) -> wire::InputFrame {
+    let kind = match *m {
+        InputMsg::Enter(e) => input_frame::Kind::Enter(wire::Enter {
+            epoch: e.epoch,
+            at: Some(point_to_wire(e.at)),
+        }),
+        InputMsg::Leave(l) => input_frame::Kind::Leave(wire::Leave { epoch: l.epoch }),
+        InputMsg::TakeControl(t) => {
+            input_frame::Kind::TakeControl(wire::TakeControl { epoch: t.epoch })
+        }
+        InputMsg::Key(k) => input_frame::Kind::Key(wire::Key {
+            hid: k.hid.0,
+            down: k.down,
+            repeat: k.repeat,
+        }),
+        InputMsg::Button(b) => input_frame::Kind::Button(wire::Button {
+            button: button_to_wire(b.button) as i32,
+            down: b.down,
+            at: Some(point_to_wire(b.at)),
+        }),
+        InputMsg::Wheel(w) => input_frame::Kind::Wheel(wire::Wheel {
+            dx: w.dx,
+            dy: w.dy,
+            unit: unit_to_wire(w.unit) as i32,
+        }),
+        InputMsg::ModifierSync(m) => input_frame::Kind::ModifierSync(wire::ModifierSync {
+            mask: u32::from(m.0),
+        }),
+        InputMsg::Ping(p) => input_frame::Kind::Ping(ping_to_wire(p)),
+        InputMsg::Pong(p) => input_frame::Kind::Pong(pong_to_wire(p)),
+    };
+    wire::InputFrame { kind: Some(kind) }
+}
+
+pub(crate) fn datagram_to_wire(m: &DatagramMsg) -> wire::DatagramFrame {
+    let kind = match *m {
+        DatagramMsg::MouseAbs(a) => datagram_frame::Kind::MouseAbs(wire::MouseAbs {
+            epoch: a.epoch,
+            seq: a.seq,
+            at: Some(point_to_wire(a.at)),
+        }),
+        DatagramMsg::Ping(p) => datagram_frame::Kind::Ping(ping_to_wire(p)),
+        DatagramMsg::Pong(p) => datagram_frame::Kind::Pong(pong_to_wire(p)),
+    };
+    wire::DatagramFrame { kind: Some(kind) }
+}
+
+// ---------- wire -> domain ----------
+
+fn point_from_wire(p: Option<wire::Point>, field: &'static str) -> Result<Point, ProtoError> {
+    p.map(|p| Point::new(p.x, p.y))
+        .ok_or(ProtoError::MissingField(field))
+}
+
+fn os_from_wire(v: i32) -> Result<Os, ProtoError> {
+    match wire::Os::try_from(v) {
+        Ok(wire::Os::Macos) => Ok(Os::MacOs),
+        Ok(wire::Os::Windows) => Ok(Os::Windows),
+        _ => Err(ProtoError::InvalidEnum {
+            field: "hello.os",
+            value: v,
+        }),
+    }
+}
+
+fn side_from_wire(v: i32) -> Result<Option<Side>, ProtoError> {
+    match wire::Side::try_from(v) {
+        Ok(wire::Side::Unspecified) => Ok(None),
+        Ok(wire::Side::Left) => Ok(Some(Side::Left)),
+        Ok(wire::Side::Right) => Ok(Some(Side::Right)),
+        Err(_) => Err(ProtoError::InvalidEnum {
+            field: "hello.peer_side",
+            value: v,
+        }),
+    }
+}
+
+fn role_from_wire(v: i32) -> Result<RoleKind, ProtoError> {
+    match wire::Role::try_from(v) {
+        Ok(wire::Role::Idle) => Ok(RoleKind::Idle),
+        Ok(wire::Role::Controlling) => Ok(RoleKind::Controlling),
+        Ok(wire::Role::Controlled) => Ok(RoleKind::Controlled),
+        _ => Err(ProtoError::InvalidEnum {
+            field: "heartbeat.role",
+            value: v,
+        }),
+    }
+}
+
+fn button_from_wire(v: i32) -> Result<MouseButton, ProtoError> {
+    match wire::MouseButton::try_from(v) {
+        Ok(wire::MouseButton::Left) => Ok(MouseButton::Left),
+        Ok(wire::MouseButton::Right) => Ok(MouseButton::Right),
+        Ok(wire::MouseButton::Middle) => Ok(MouseButton::Middle),
+        Ok(wire::MouseButton::Back) => Ok(MouseButton::Back),
+        Ok(wire::MouseButton::Forward) => Ok(MouseButton::Forward),
+        _ => Err(ProtoError::InvalidEnum {
+            field: "button.button",
+            value: v,
+        }),
+    }
+}
+
+fn unit_from_wire(v: i32) -> Result<WheelUnit, ProtoError> {
+    match wire::WheelUnit::try_from(v) {
+        Ok(wire::WheelUnit::Notch120) => Ok(WheelUnit::Notch120),
+        Ok(wire::WheelUnit::Pixel) => Ok(WheelUnit::Pixel),
+        _ => Err(ProtoError::InvalidEnum {
+            field: "wheel.unit",
+            value: v,
+        }),
+    }
+}
+
+fn hid_from_wire(v: u32) -> Result<Hid, ProtoError> {
+    let hid = Hid(v);
+    if v > 0x00FF_FFFF || !matches!(hid.page(), 0x07 | 0x0C) {
+        return Err(ProtoError::InvalidValue {
+            field: "key.hid",
+            reason: "usage page must be 0x07 or 0x0C",
+        });
+    }
+    Ok(hid)
+}
+
+fn mask_from_wire(v: u32) -> Result<ModifierMask, ProtoError> {
+    u8::try_from(v)
+        .map(ModifierMask)
+        .map_err(|_| ProtoError::InvalidValue {
+            field: "modifier_sync.mask",
+            reason: "mask exceeds 8 bits",
+        })
+}
+
+fn string_from_wire(s: String, field: &'static str) -> Result<String, ProtoError> {
+    if s.len() > MAX_STRING_LEN {
+        return Err(ProtoError::InvalidValue {
+            field,
+            reason: "string longer than 256 bytes",
+        });
+    }
+    Ok(s)
+}
+
+fn geometry_reason(e: &GeometryError) -> &'static str {
+    match e {
+        GeometryError::InvalidSize { .. } => "screen size outside 1..=65536",
+        GeometryError::InvalidOrigin { .. } => "screen origin outside +-2^20",
+        GeometryError::NoScreens => "no screens",
+        GeometryError::TooManyScreens(_) => "more than 16 screens",
+        GeometryError::DuplicateScreenId(_) => "duplicate screen id",
+        GeometryError::InvalidScale(_) => "native_per_logical outside 0.25..=8",
+    }
+}
+
+fn screens_from_wire(screens: Vec<wire::Screen>) -> Result<Vec<ScreenInfo>, ProtoError> {
+    let invalid = |e: GeometryError| ProtoError::InvalidValue {
+        field: "hello.screens",
+        reason: geometry_reason(&e),
+    };
+    if screens.len() > macwin_core::geometry::MAX_SCREENS {
+        return Err(invalid(GeometryError::TooManyScreens(screens.len())));
+    }
+    let mut out = Vec::with_capacity(screens.len());
+    for s in screens {
+        let w = i32::try_from(s.w).unwrap_or(i32::MAX);
+        let h = i32::try_from(s.h).unwrap_or(i32::MAX);
+        out.push(ScreenInfo {
+            id: s.id,
+            rect: Rect::new(s.x, s.y, w, h).map_err(invalid)?,
+            native_per_logical: s.native_per_logical,
+            primary: s.primary,
+        });
+    }
+    // Count, unique ids and scale range.
+    ScreenSet::new(out.clone()).map_err(invalid)?;
+    Ok(out)
+}
+
+fn hello_from_wire(h: wire::Hello) -> Result<Hello, ProtoError> {
+    if h.capabilities.len() > MAX_CAPABILITIES
+        || h.capabilities.iter().any(|c| c.len() > MAX_CAPABILITY_LEN)
+    {
+        return Err(ProtoError::InvalidValue {
+            field: "hello.capabilities",
+            reason: "at most 32 capabilities of at most 64 bytes",
+        });
+    }
+    Ok(Hello {
+        protocol_version: h.protocol_version,
+        capabilities: h.capabilities,
+        os: os_from_wire(h.os)?,
+        os_version: string_from_wire(h.os_version, "hello.os_version")?,
+        device_name: string_from_wire(h.device_name, "hello.device_name")?,
+        screens: screens_from_wire(h.screens)?,
+        peer_side: side_from_wire(h.peer_side)?,
+        agent_version: string_from_wire(h.agent_version, "hello.agent_version")?,
+    })
+}
+
+fn ping_from_wire(p: wire::Ping) -> Ping {
+    Ping {
+        id: p.id,
+        sent_micros: p.sent_micros,
+    }
+}
+
+fn pong_from_wire(p: wire::Pong) -> Pong {
+    Pong {
+        id: p.id,
+        ping_sent_micros: p.ping_sent_micros,
+    }
+}
+
+pub(crate) fn control_from_wire(f: wire::ControlFrame) -> Result<ControlMsg, ProtoError> {
+    match f.kind.ok_or(ProtoError::UnknownKind("control frame"))? {
+        control_frame::Kind::Hello(h) => Ok(ControlMsg::Hello(hello_from_wire(h)?)),
+        control_frame::Kind::Heartbeat(hb) => Ok(ControlMsg::Heartbeat(Heartbeat {
+            epoch: hb.epoch,
+            role: role_from_wire(hb.role)?,
+        })),
+        control_frame::Kind::Ping(p) => Ok(ControlMsg::Ping(ping_from_wire(p))),
+        control_frame::Kind::Pong(p) => Ok(ControlMsg::Pong(pong_from_wire(p))),
+    }
+}
+
+pub(crate) fn input_from_wire(f: wire::InputFrame) -> Result<InputMsg, ProtoError> {
+    Ok(
+        match f.kind.ok_or(ProtoError::UnknownKind("input frame"))? {
+            input_frame::Kind::Enter(e) => InputMsg::Enter(Enter {
+                epoch: e.epoch,
+                at: point_from_wire(e.at, "enter.at")?,
+            }),
+            input_frame::Kind::Leave(l) => InputMsg::Leave(Leave { epoch: l.epoch }),
+            input_frame::Kind::TakeControl(t) => {
+                InputMsg::TakeControl(TakeControl { epoch: t.epoch })
+            }
+            input_frame::Kind::Key(k) => InputMsg::Key(KeyMsg {
+                hid: hid_from_wire(k.hid)?,
+                down: k.down,
+                repeat: k.repeat,
+            }),
+            input_frame::Kind::Button(b) => InputMsg::Button(ButtonMsg {
+                button: button_from_wire(b.button)?,
+                down: b.down,
+                at: point_from_wire(b.at, "button.at")?,
+            }),
+            input_frame::Kind::Wheel(w) => InputMsg::Wheel(WheelMsg {
+                dx: w.dx,
+                dy: w.dy,
+                unit: unit_from_wire(w.unit)?,
+            }),
+            input_frame::Kind::ModifierSync(m) => InputMsg::ModifierSync(mask_from_wire(m.mask)?),
+            input_frame::Kind::Ping(p) => InputMsg::Ping(ping_from_wire(p)),
+            input_frame::Kind::Pong(p) => InputMsg::Pong(pong_from_wire(p)),
+        },
+    )
+}
+
+pub(crate) fn datagram_from_wire(f: wire::DatagramFrame) -> Result<DatagramMsg, ProtoError> {
+    Ok(
+        match f.kind.ok_or(ProtoError::UnknownKind("datagram frame"))? {
+            datagram_frame::Kind::MouseAbs(a) => DatagramMsg::MouseAbs(MouseAbs {
+                epoch: a.epoch,
+                seq: a.seq,
+                at: point_from_wire(a.at, "mouse_abs.at")?,
+            }),
+            datagram_frame::Kind::Ping(p) => DatagramMsg::Ping(ping_from_wire(p)),
+            datagram_frame::Kind::Pong(p) => DatagramMsg::Pong(pong_from_wire(p)),
+        },
+    )
+}

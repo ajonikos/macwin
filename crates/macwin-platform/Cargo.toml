@@ -1,0 +1,17 @@
+[package]
+name = "macwin-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Exposes the in-memory fakes in `macwin_platform::testing`.
+testing = []
+
+[dependencies]
+macwin-core = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,42 @@
+# cargo-deny configuration (v2 format). Runs in CI; the [graph] targets make a
+# single run cover both the macOS and the Windows dependency graphs.
+
+[graph]
+all-features = true
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+version = 2
+
+[licenses]
+version = 2
+# Only these licenses are allowed; everything else (GPL, AGPL, LGPL, ...) is
+# denied. A crate passes if its license expression can be satisfied with them.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+# Workspace crates are publish = false and intentionally unlicensed for now.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path dependencies have no version; allowed because every workspace
+# crate is private (publish = false).
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

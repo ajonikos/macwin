@@ -1,0 +1,10 @@
+Fetched by tools/keymap-gen/fetch.sh on 2026-10-12T17:52:28Z (UTC).
+Both files are stored unmodified (base64-decoded gitiles ?format=TEXT output).
+
+dom_code_data.inc
+  url:    https://chromium.googlesource.com/chromium/src/+/main/ui/events/keycodes/dom/dom_code_data.inc?format=TEXT
+  sha256: 841e2c58e6388f14736717eb6e365c8b8e9767788e36339bf1d35a37ab48e5b2
+
+LICENSE.chromium
+  url:    https://chromium.googlesource.com/chromium/src/+/main/LICENSE?format=TEXT
+  sha256: 368cca1106be99d39ecd32a38d8305585d802a475effb66380b91ffc9bcf709b

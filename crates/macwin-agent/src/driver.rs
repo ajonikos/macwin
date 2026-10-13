@@ -1,0 +1,376 @@
+//! Session driver: wires a capture backend, the Engine, a [`Link`] and an
+//! injector together. Transport-agnostic (it only sees `macwin_net::link`
+//! types), so Phase 0b's `spike kvm` plugs the real OS backends in and the
+//! tests plug fakes in.
+//!
+//! Concurrency: one `Arc<Mutex<Core>>`. The capture thread locks it from
+//! `CaptureSink::on_event`; the async loop locks it for link messages, ticks
+//! and shutdown. Nothing awaits while holding the lock, and the lock order
+//! is always Core -> backend internals.
+
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
+
+use macwin_core::engine::{
+    Action, CloseReason, Engine, EngineConfig, PeerInfo, Timings, TransportRole,
+};
+use macwin_core::msg::{CAP_INPUT_CAPTURE, CAP_INPUT_INJECT, Hello};
+use macwin_core::types::{CaptureFault, CapturedEvent, Os, RoleKind, ScreenInfo, Side};
+use macwin_net::codes;
+use macwin_net::link::{Inbound, Link, LinkClosed, LinkSender};
+use macwin_platform::{
+    CaptureControl, CaptureSink, InputCapture, InputInjector, PlatformError, ScreenSource,
+};
+use macwin_proto::PROTOCOL_VERSION;
+use tokio::sync::{Notify, mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
+use tracing::{info, warn};
+
+/// Static configuration of one KVM session.
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    pub local_os: Os,
+    pub os_version: String,
+    pub device_name: String,
+    /// "The peer is to my left/right".
+    pub peer_side: Side,
+    /// Apply the Ctrl <-> Cmd/Win remap when this machine controls.
+    pub remap: bool,
+    pub timings: Timings,
+}
+
+/// The OS (or fake) backends of one machine.
+pub struct Backends {
+    pub capture: Box<dyn InputCapture>,
+    pub injector: Box<dyn InputInjector>,
+    pub screens: Box<dyn ScreenSource>,
+}
+
+/// The Hello a KVM agent sends: it can both control and be controlled.
+pub fn kvm_hello(cfg: &SessionConfig, screens: Vec<ScreenInfo>) -> Hello {
+    Hello {
+        protocol_version: PROTOCOL_VERSION,
+        capabilities: vec![CAP_INPUT_CAPTURE.into(), CAP_INPUT_INJECT.into()],
+        os: cfg.local_os,
+        os_version: cfg.os_version.clone(),
+        device_name: cfg.device_name.clone(),
+        screens,
+        peer_side: Some(cfg.peer_side),
+        agent_version: env!("CARGO_PKG_VERSION").into(),
+    }
+}
+
+/// What the Engine needs from the peer's Hello.
+pub fn peer_info(h: &Hello) -> PeerInfo {
+    PeerInfo {
+        os: h.os,
+        screens: h.screens.clone(),
+        capabilities: h.capabilities.clone(),
+        device_name: h.device_name.clone(),
+    }
+}
+
+/// An established connection handed to the driver.
+pub struct Connected {
+    pub link: Link,
+    pub peer: Hello,
+    pub role: TransportRole,
+}
+
+/// Why a session ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEnd {
+    PeerClosed,
+    HeartbeatTimeout,
+    ProtocolViolation(String),
+    Shutdown,
+    Transport(String),
+    Internal(String),
+}
+
+/// A running session.
+pub struct SessionHandle {
+    /// The current role, updated after every Engine step.
+    pub role: watch::Receiver<RoleKind>,
+    shutdown: Arc<Notify>,
+    join: JoinHandle<SessionEnd>,
+}
+
+impl SessionHandle {
+    /// Asks for a graceful stop (Leave to the peer, release, close).
+    pub fn shutdown(&self) {
+        self.shutdown.notify_one();
+    }
+
+    /// Waits for the session to end.
+    pub async fn join(self) -> SessionEnd {
+        self.join
+            .await
+            .unwrap_or_else(|e| SessionEnd::Internal(format!("driver task failed: {e}")))
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.join.is_finished()
+    }
+}
+
+struct Core {
+    engine: Engine,
+    injector: Box<dyn InputInjector>,
+    capture: Option<Arc<dyn CaptureControl>>,
+    link: LinkSender,
+    role_tx: watch::Sender<RoleKind>,
+    end: Option<SessionEnd>,
+}
+
+fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
+    // A panic elsewhere must not leave input grabbed: keep going.
+    core.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn end_for_reason(r: CloseReason) -> SessionEnd {
+    match r {
+        CloseReason::HeartbeatTimeout => SessionEnd::HeartbeatTimeout,
+        CloseReason::ProtocolViolation(s) => SessionEnd::ProtocolViolation(s.to_string()),
+        CloseReason::Shutdown => SessionEnd::Shutdown,
+        CloseReason::Internal(s) => SessionEnd::Internal(s.to_string()),
+    }
+}
+
+fn end_for_link(c: LinkClosed) -> SessionEnd {
+    match c {
+        LinkClosed::PeerClosed { .. } => SessionEnd::PeerClosed,
+        LinkClosed::LocalClosed { code } => {
+            SessionEnd::Internal(format!("link closed locally (code {code})"))
+        }
+        LinkClosed::TimedOut => SessionEnd::Transport("the connection timed out".into()),
+        LinkClosed::Transport(s) => SessionEnd::Transport(s),
+        LinkClosed::ProtocolViolation(s) => SessionEnd::ProtocolViolation(s),
+    }
+}
+
+impl Core {
+    fn set_end(&mut self, end: SessionEnd) {
+        if self.end.is_none() {
+            self.end = Some(end);
+        }
+    }
+
+    /// Executes Engine actions in order.
+    fn dispatch(&mut self, actions: Vec<Action>) {
+        for action in actions {
+            match action {
+                Action::SendControl(m) => {
+                    if let Err(e) = self.link.send_control(m) {
+                        self.set_end(SessionEnd::Internal(format!(
+                            "cannot send a control message: {e}"
+                        )));
+                    }
+                }
+                Action::SendInput(m) => {
+                    if let Err(e) = self.link.send_input(m) {
+                        self.set_end(SessionEnd::Internal(format!(
+                            "cannot send an input message: {e}"
+                        )));
+                    }
+                }
+                Action::SendDatagram(m) => self.link.send_datagram(m),
+                Action::Inject(cmd) => {
+                    if let Err(e) = self.injector.inject(cmd) {
+                        warn!(error = %e, "injection failed");
+                    }
+                }
+                Action::Capture(cmd) => {
+                    if let Some(c) = &self.capture {
+                        c.command(cmd);
+                    }
+                }
+                Action::RenewLease(until) => {
+                    if let Some(c) = &self.capture {
+                        c.renew_lease(until);
+                    }
+                }
+                Action::Close(reason) => {
+                    self.link.close(codes::code_for(&reason));
+                    self.set_end(end_for_reason(reason));
+                }
+            }
+        }
+        self.role_tx.send_replace(self.engine.role());
+    }
+}
+
+struct Sink {
+    core: Arc<Mutex<Core>>,
+    wake: Arc<Notify>,
+}
+
+impl CaptureSink for Sink {
+    fn on_event(&self, ev: CapturedEvent) -> bool {
+        let mut core = lock(&self.core);
+        if core.end.is_some() {
+            // The session is over: local input stays local.
+            return true;
+        }
+        let out = core.engine.on_local_event(Instant::now(), ev);
+        core.dispatch(out.actions);
+        if core.end.is_some() {
+            self.wake.notify_one();
+        }
+        out.deliver
+    }
+
+    fn on_fault(&self, fault: CaptureFault) {
+        warn!(?fault, "capture fault");
+        let mut core = lock(&self.core);
+        let actions = core.engine.on_capture_fault(Instant::now(), fault);
+        core.dispatch(actions);
+        if core.end.is_some() {
+            self.wake.notify_one();
+        }
+    }
+}
+
+/// Starts the session: reads the screens, builds the Engine, starts capture
+/// and runs the driver loop on the current tokio runtime.
+pub fn spawn_session(
+    cfg: SessionConfig,
+    backends: Backends,
+    conn: Connected,
+) -> Result<SessionHandle, PlatformError> {
+    let Backends {
+        mut capture,
+        injector,
+        screens,
+    } = backends;
+    let Connected { link, peer, role } = conn;
+    let Link { tx, rx } = link;
+    let fail = |tx: &LinkSender, e: PlatformError| {
+        tx.close_now(codes::INTERNAL);
+        e
+    };
+    let local_screens = screens.screens().map_err(|e| fail(&tx, e))?;
+    let engine = Engine::new(EngineConfig {
+        local_os: cfg.local_os,
+        local_screens,
+        peer_side: cfg.peer_side,
+        remap: cfg.remap,
+        timings: cfg.timings,
+    })
+    .map_err(|e| {
+        fail(
+            &tx,
+            PlatformError::Backend(format!("invalid local screens: {e}")),
+        )
+    })?;
+    if peer.peer_side == Some(cfg.peer_side) {
+        warn!(
+            side = ?cfg.peer_side,
+            "both machines place their peer on the same side; check the peer-side settings"
+        );
+    }
+    let (role_tx, role_rx) = watch::channel(RoleKind::Idle);
+    let core = Arc::new(Mutex::new(Core {
+        engine,
+        injector,
+        capture: None,
+        link: tx.clone(),
+        role_tx,
+        end: None,
+    }));
+    let wake = Arc::new(Notify::new());
+    let control = capture
+        .start(Arc::new(Sink {
+            core: core.clone(),
+            wake: wake.clone(),
+        }))
+        .map_err(|e| fail(&tx, e))?;
+    {
+        let mut c = lock(&core);
+        c.capture = Some(control.clone());
+        let actions = c
+            .engine
+            .on_connected(Instant::now(), peer_info(&peer), role);
+        c.dispatch(actions);
+    }
+    let shutdown = Arc::new(Notify::new());
+    let join = tokio::spawn(run(core, rx, cfg.timings, shutdown.clone(), wake, control));
+    Ok(SessionHandle {
+        role: role_rx,
+        shutdown,
+        join,
+    })
+}
+
+async fn run(
+    core: Arc<Mutex<Core>>,
+    mut rx: mpsc::Receiver<Inbound>,
+    timings: Timings,
+    shutdown: Arc<Notify>,
+    wake: Arc<Notify>,
+    capture: Arc<dyn CaptureControl>,
+) -> SessionEnd {
+    let mut tick = tokio::time::interval(timings.tick);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                let now = Instant::now();
+                let mut c = lock(&core);
+                match msg {
+                    Some(Inbound::Control(m)) => {
+                        let a = c.engine.on_control(now, m);
+                        c.dispatch(a);
+                    }
+                    Some(Inbound::Input(m)) => {
+                        let a = c.engine.on_input(now, m);
+                        c.dispatch(a);
+                    }
+                    Some(Inbound::Datagram(m)) => {
+                        let a = c.engine.on_datagram(now, m);
+                        c.dispatch(a);
+                    }
+                    Some(Inbound::Closed(reason)) => {
+                        info!(?reason, "link closed");
+                        let a = c.engine.on_disconnected(now);
+                        c.dispatch(a);
+                        c.set_end(end_for_link(reason));
+                    }
+                    None => {
+                        let a = c.engine.on_disconnected(now);
+                        c.dispatch(a);
+                        c.set_end(SessionEnd::Transport("the link went away".into()));
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                let mut c = lock(&core);
+                let a = c.engine.on_tick(Instant::now());
+                c.dispatch(a);
+            }
+            () = shutdown.notified() => {
+                let mut c = lock(&core);
+                let a = c.engine.shutdown(Instant::now());
+                c.dispatch(a);
+                c.set_end(SessionEnd::Shutdown);
+            }
+            () = wake.notified() => {}
+        }
+        let mut c = lock(&core);
+        if let Some(end) = c.end.clone() {
+            // Make sure nothing stays injected or grabbed, whatever ended it.
+            if c.engine.has_session() {
+                let a = c.engine.on_disconnected(Instant::now());
+                c.dispatch(a);
+            }
+            if !c.link.is_closed() {
+                c.link.close_now(codes::INTERNAL);
+            }
+            drop(c);
+            capture.stop();
+            info!(?end, "session ended");
+            return end;
+        }
+    }
+}
