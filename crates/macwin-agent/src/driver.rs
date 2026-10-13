@@ -9,23 +9,29 @@
 //! is always Core -> backend internals.
 
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use macwin_core::clipboard::{ClipboardSync, LocalClipboard, RemoteOutcome};
 use macwin_core::engine::{
     Action, CloseReason, Engine, EngineConfig, PeerInfo, Timings, TransportRole,
 };
-use macwin_core::msg::{CAP_INPUT_CAPTURE, CAP_INPUT_INJECT, Hello};
+use macwin_core::msg::{
+    CAP_CLIPBOARD_TEXT, CAP_INPUT_CAPTURE, CAP_INPUT_INJECT, ClipboardMsg, Hello,
+};
 use macwin_core::types::{CaptureFault, CapturedEvent, Os, RoleKind, ScreenInfo, Side};
 use macwin_net::codes;
 use macwin_net::link::{Inbound, Link, LinkClosed, LinkSender};
 use macwin_platform::{
-    CaptureControl, CaptureSink, InputCapture, InputInjector, PlatformError, ScreenSource,
+    CaptureControl, CaptureSink, ClipboardBackend, InputCapture, InputInjector, PlatformError,
+    ScreenSource,
 };
 use macwin_proto::PROTOCOL_VERSION;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+use crate::clipboard::{ClipboardWorker, POLL_INTERVAL};
 
 /// Static configuration of one KVM session.
 #[derive(Debug, Clone)]
@@ -38,6 +44,26 @@ pub struct SessionConfig {
     /// Apply the Ctrl <-> Cmd/Win remap when this machine controls.
     pub remap: bool,
     pub timings: Timings,
+    /// Share plain-text clipboard contents; `None` turns sharing off.
+    pub clipboard: Option<ClipboardSettings>,
+}
+
+/// Clipboard sharing settings of a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardSettings {
+    /// Texts above this size are neither sent nor written.
+    pub max_text_bytes: usize,
+    /// How often the clipboard is checked for changes.
+    pub poll: Duration,
+}
+
+impl ClipboardSettings {
+    pub fn new(max_text_bytes: usize) -> ClipboardSettings {
+        ClipboardSettings {
+            max_text_bytes,
+            poll: POLL_INTERVAL,
+        }
+    }
 }
 
 /// The OS (or fake) backends of one machine.
@@ -45,13 +71,20 @@ pub struct Backends {
     pub capture: Box<dyn InputCapture>,
     pub injector: Box<dyn InputInjector>,
     pub screens: Box<dyn ScreenSource>,
+    /// Needed only when the session shares the clipboard.
+    pub clipboard: Option<Box<dyn ClipboardBackend>>,
 }
 
-/// The Hello a KVM agent sends: it can both control and be controlled.
+/// The Hello a KVM agent sends: it can both control and be controlled, and
+/// shares its clipboard when configured to.
 pub fn kvm_hello(cfg: &SessionConfig, screens: Vec<ScreenInfo>) -> Hello {
+    let mut capabilities = vec![CAP_INPUT_CAPTURE.into(), CAP_INPUT_INJECT.into()];
+    if cfg.clipboard.is_some() {
+        capabilities.push(CAP_CLIPBOARD_TEXT.into());
+    }
     Hello {
         protocol_version: PROTOCOL_VERSION,
-        capabilities: vec![CAP_INPUT_CAPTURE.into(), CAP_INPUT_INJECT.into()],
+        capabilities,
         os: cfg.local_os,
         os_version: cfg.os_version.clone(),
         device_name: cfg.device_name.clone(),
@@ -226,6 +259,80 @@ impl Core {
     }
 }
 
+/// Clipboard sharing of a running session.
+struct Clip {
+    sync: ClipboardSync,
+    worker: ClipboardWorker,
+}
+
+impl Clip {
+    fn on_local(&mut self, content: LocalClipboard, link: &LinkSender) {
+        let out = self.sync.on_local_change(content);
+        debug!(kind = ?out.kind, "local clipboard change");
+        if let Some(m) = out.send
+            && let Err(e) = link.send_clipboard(m)
+        {
+            debug!(error = %e, "clipboard update not sent");
+        }
+    }
+
+    fn on_remote(&mut self, m: ClipboardMsg) {
+        match self.sync.on_remote(m) {
+            RemoteOutcome::Write(text) => {
+                debug!(bytes = text.len(), "writing the peer's clipboard text");
+                self.worker.write(text);
+            }
+            other => debug!(outcome = ?other, "peer clipboard update"),
+        }
+    }
+}
+
+/// Starts clipboard sharing when both sides want it.
+fn start_clipboard(
+    settings: Option<ClipboardSettings>,
+    backend: Option<Box<dyn ClipboardBackend>>,
+    peer: &Hello,
+    role: TransportRole,
+) -> Option<(Clip, mpsc::Receiver<LocalClipboard>)> {
+    let settings = settings?;
+    let Some(backend) = backend else {
+        warn!("clipboard sharing is off: no clipboard backend");
+        return None;
+    };
+    if !peer.has_capability(CAP_CLIPBOARD_TEXT) {
+        info!("clipboard sharing is off: the peer does not share its clipboard");
+        return None;
+    }
+    match ClipboardWorker::start(backend, settings.max_text_bytes, settings.poll) {
+        Ok((worker, events)) => {
+            info!("clipboard sharing is on");
+            let sync = ClipboardSync::new(role, settings.max_text_bytes);
+            Some((Clip { sync, worker }, events))
+        }
+        Err(e) => {
+            warn!(error = %e, "clipboard sharing is off: the clipboard is unavailable");
+            None
+        }
+    }
+}
+
+/// A started capture backend and its control. The backend must live as long
+/// as the session: real backends stop their capture thread when dropped.
+struct Capture {
+    control: Arc<dyn CaptureControl>,
+    _backend: Box<dyn InputCapture>,
+}
+
+/// The next local clipboard change, or never when sharing is off.
+async fn next_local_clip(
+    events: &mut Option<mpsc::Receiver<LocalClipboard>>,
+) -> Option<LocalClipboard> {
+    match events {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 struct Sink {
     core: Arc<Mutex<Core>>,
     wake: Arc<Notify>,
@@ -277,6 +384,7 @@ pub fn spawn_session(
         mut capture,
         injector,
         screens,
+        clipboard,
     } = backends;
     let Connected { link, peer, role } = conn;
     let Link { tx, rx } = link;
@@ -328,8 +436,22 @@ pub fn spawn_session(
             .on_connected(Instant::now(), peer_info(&peer), role);
         c.dispatch(actions);
     }
+    let clip = start_clipboard(cfg.clipboard, clipboard, &peer, role);
     let shutdown = Arc::new(Notify::new());
-    let join = tokio::spawn(run(core, rx, cfg.timings, shutdown.clone(), wake, control));
+    // The run task owns the capture backend: dropping it stops capturing.
+    let join = tokio::spawn(run(
+        core,
+        rx,
+        cfg.timings,
+        shutdown.clone(),
+        wake,
+        Capture {
+            control,
+            _backend: capture,
+        },
+        tx.clone(),
+        clip,
+    ));
     Ok(SessionHandle {
         role: role_rx,
         shutdown,
@@ -338,22 +460,42 @@ pub fn spawn_session(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     core: Arc<Mutex<Core>>,
     mut rx: mpsc::Receiver<Inbound>,
     timings: Timings,
     shutdown: Arc<Notify>,
     wake: Arc<Notify>,
-    capture: Arc<dyn CaptureControl>,
+    capture: Capture,
+    link: LinkSender,
+    clip: Option<(Clip, mpsc::Receiver<LocalClipboard>)>,
 ) -> SessionEnd {
     let mut tick = tokio::time::interval(timings.tick);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let (mut clip, mut clip_events) = match clip {
+        Some((c, events)) => (Some(c), Some(events)),
+        None => (None, None),
+    };
     loop {
         tokio::select! {
+            content = next_local_clip(&mut clip_events) => {
+                match (content, clip.as_mut()) {
+                    (Some(content), Some(clip)) => clip.on_local(content, &link),
+                    _ => {
+                        warn!("the clipboard thread stopped; clipboard sharing is off");
+                        clip_events = None;
+                    }
+                }
+            }
             msg = rx.recv() => {
                 let now = Instant::now();
                 let mut c = lock(&core);
                 match msg {
+                    Some(Inbound::Clipboard(m)) => match clip.as_mut() {
+                        Some(clip) => clip.on_remote(m),
+                        None => debug!("clipboard update ignored: sharing is off"),
+                    },
                     Some(Inbound::Control(m)) => {
                         let a = c.engine.on_control(now, m);
                         c.dispatch(a);
@@ -402,8 +544,18 @@ async fn run(
             if !c.link.is_closed() {
                 c.link.close_now(codes::INTERNAL);
             }
+            // Core -> control -> backend state -> sink -> Core is a cycle:
+            // break it so the session (and its connection) can be freed.
+            c.capture = None;
             drop(c);
-            capture.stop();
+            capture.control.stop();
+            let clip = clip.take();
+            // Dropping the backends joins their threads: keep that off the
+            // async workers.
+            tokio::task::spawn_blocking(move || {
+                drop(capture);
+                drop(clip);
+            });
             info!(?end, "session ended");
             return end;
         }

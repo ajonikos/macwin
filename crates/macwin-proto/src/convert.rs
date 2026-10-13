@@ -4,16 +4,20 @@
 
 use macwin_core::geometry::ScreenSet;
 use macwin_core::msg::{
-    ButtonMsg, ControlMsg, DatagramMsg, Enter, Heartbeat, Hello, InputMsg, KeyMsg, Leave, MouseAbs,
-    Ping, Pong, TakeControl, WheelMsg,
+    ButtonMsg, ClipboardMsg, ClipboardText, ControlMsg, DatagramMsg, Enter, Heartbeat, Hello,
+    InputMsg, KeyMsg, Leave, MouseAbs, PairConfirm, PairHello, PairMsg, Ping, Pong, TakeControl,
+    WheelMsg,
 };
 use macwin_core::types::{
     GeometryError, Hid, ModifierMask, MouseButton, Os, Point, Rect, RoleKind, ScreenInfo, Side,
     WheelUnit,
 };
 
-use crate::wire::{self, control_frame, datagram_frame, input_frame};
-use crate::{MAX_CAPABILITIES, MAX_CAPABILITY_LEN, MAX_STRING_LEN, ProtoError};
+use crate::wire::{self, clipboard_frame, control_frame, datagram_frame, input_frame, pair_frame};
+use crate::{
+    MAX_CAPABILITIES, MAX_CAPABILITY_LEN, MAX_CLIPBOARD_TEXT, MAX_STRING_LEN, PAIR_MAC_LEN,
+    ProtoError, SPAKE_MSG_LEN,
+};
 
 // ---------- domain -> wire ----------
 
@@ -147,6 +151,37 @@ pub(crate) fn input_to_wire(m: &InputMsg) -> wire::InputFrame {
     wire::InputFrame { kind: Some(kind) }
 }
 
+pub(crate) fn clipboard_to_wire(m: &ClipboardMsg) -> wire::ClipboardFrame {
+    let kind = match m {
+        ClipboardMsg::Text(t) => clipboard_frame::Kind::Text(wire::ClipboardText {
+            clock: t.clock,
+            text: t.text.clone(),
+        }),
+        ClipboardMsg::Other { clock } => {
+            clipboard_frame::Kind::Other(wire::ClipboardOther { clock: *clock })
+        }
+    };
+    wire::ClipboardFrame { kind: Some(kind) }
+}
+
+pub(crate) fn pair_to_wire(m: &PairMsg) -> wire::PairFrame {
+    let kind = match m {
+        PairMsg::Hello(h) => pair_frame::Kind::Hello(wire::PairHello {
+            protocol_version: h.protocol_version,
+            os: os_to_wire(h.os) as i32,
+            device_name: h.device_name.clone(),
+            agent_version: h.agent_version.clone(),
+            peer_side: side_to_wire(h.peer_side) as i32,
+            spake: h.spake.clone(),
+        }),
+        PairMsg::Confirm(c) => pair_frame::Kind::Confirm(wire::PairConfirm {
+            mac: c.mac.to_vec(),
+        }),
+        PairMsg::Done => pair_frame::Kind::Done(wire::PairDone {}),
+    };
+    wire::PairFrame { kind: Some(kind) }
+}
+
 pub(crate) fn datagram_to_wire(m: &DatagramMsg) -> wire::DatagramFrame {
     let kind = match *m {
         DatagramMsg::MouseAbs(a) => datagram_frame::Kind::MouseAbs(wire::MouseAbs {
@@ -167,26 +202,20 @@ fn point_from_wire(p: Option<wire::Point>, field: &'static str) -> Result<Point,
         .ok_or(ProtoError::MissingField(field))
 }
 
-fn os_from_wire(v: i32) -> Result<Os, ProtoError> {
+fn os_from_wire(v: i32, field: &'static str) -> Result<Os, ProtoError> {
     match wire::Os::try_from(v) {
         Ok(wire::Os::Macos) => Ok(Os::MacOs),
         Ok(wire::Os::Windows) => Ok(Os::Windows),
-        _ => Err(ProtoError::InvalidEnum {
-            field: "hello.os",
-            value: v,
-        }),
+        _ => Err(ProtoError::InvalidEnum { field, value: v }),
     }
 }
 
-fn side_from_wire(v: i32) -> Result<Option<Side>, ProtoError> {
+fn side_from_wire(v: i32, field: &'static str) -> Result<Option<Side>, ProtoError> {
     match wire::Side::try_from(v) {
         Ok(wire::Side::Unspecified) => Ok(None),
         Ok(wire::Side::Left) => Ok(Some(Side::Left)),
         Ok(wire::Side::Right) => Ok(Some(Side::Right)),
-        Err(_) => Err(ProtoError::InvalidEnum {
-            field: "hello.peer_side",
-            value: v,
-        }),
+        Err(_) => Err(ProtoError::InvalidEnum { field, value: v }),
     }
 }
 
@@ -304,11 +333,11 @@ fn hello_from_wire(h: wire::Hello) -> Result<Hello, ProtoError> {
     Ok(Hello {
         protocol_version: h.protocol_version,
         capabilities: h.capabilities,
-        os: os_from_wire(h.os)?,
+        os: os_from_wire(h.os, "hello.os")?,
         os_version: string_from_wire(h.os_version, "hello.os_version")?,
         device_name: string_from_wire(h.device_name, "hello.device_name")?,
         screens: screens_from_wire(h.screens)?,
-        peer_side: side_from_wire(h.peer_side)?,
+        peer_side: side_from_wire(h.peer_side, "hello.peer_side")?,
         agent_version: string_from_wire(h.agent_version, "hello.agent_version")?,
     })
 }
@@ -384,4 +413,55 @@ pub(crate) fn datagram_from_wire(f: wire::DatagramFrame) -> Result<DatagramMsg, 
             datagram_frame::Kind::Pong(p) => DatagramMsg::Pong(pong_from_wire(p)),
         },
     )
+}
+
+pub(crate) fn clipboard_from_wire(f: wire::ClipboardFrame) -> Result<ClipboardMsg, ProtoError> {
+    match f.kind.ok_or(ProtoError::UnknownKind("clipboard frame"))? {
+        clipboard_frame::Kind::Text(t) => {
+            if t.text.len() > MAX_CLIPBOARD_TEXT {
+                return Err(ProtoError::InvalidValue {
+                    field: "clipboard_text.text",
+                    reason: "text longer than 16 MiB",
+                });
+            }
+            Ok(ClipboardMsg::Text(ClipboardText {
+                clock: t.clock,
+                text: t.text,
+            }))
+        }
+        clipboard_frame::Kind::Other(o) => Ok(ClipboardMsg::Other { clock: o.clock }),
+    }
+}
+
+pub(crate) fn pair_from_wire(f: wire::PairFrame) -> Result<PairMsg, ProtoError> {
+    match f.kind.ok_or(ProtoError::UnknownKind("pair frame"))? {
+        pair_frame::Kind::Hello(h) => {
+            if h.spake.len() != SPAKE_MSG_LEN {
+                return Err(ProtoError::InvalidValue {
+                    field: "pair_hello.spake",
+                    reason: "SPAKE2 message must be 33 bytes",
+                });
+            }
+            Ok(PairMsg::Hello(PairHello {
+                protocol_version: h.protocol_version,
+                os: os_from_wire(h.os, "pair_hello.os")?,
+                device_name: string_from_wire(h.device_name, "pair_hello.device_name")?,
+                agent_version: string_from_wire(h.agent_version, "pair_hello.agent_version")?,
+                peer_side: side_from_wire(h.peer_side, "pair_hello.peer_side")?,
+                spake: h.spake,
+            }))
+        }
+        pair_frame::Kind::Confirm(c) => {
+            let mac: [u8; PAIR_MAC_LEN] =
+                c.mac
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| ProtoError::InvalidValue {
+                        field: "pair_confirm.mac",
+                        reason: "MAC must be 32 bytes",
+                    })?;
+            Ok(PairMsg::Confirm(PairConfirm { mac }))
+        }
+        pair_frame::Kind::Done(_) => Ok(PairMsg::Done),
+    }
 }

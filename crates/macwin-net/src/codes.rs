@@ -14,6 +14,8 @@ pub const HEARTBEAT_TIMEOUT: u32 = 3;
 pub const HELLO_TIMEOUT: u32 = 4;
 /// Local failure (for example a send queue overflow).
 pub const INTERNAL: u32 = 5;
+/// Pairing failed: wrong code (or a device that does not know it).
+pub const PAIRING_FAILED: u32 = 6;
 
 /// The close code for an Engine close reason.
 pub fn code_for(reason: &CloseReason) -> u32 {

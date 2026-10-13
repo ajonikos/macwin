@@ -11,6 +11,11 @@ pub mod spike_net;
 
 use macwin_core::types::Os;
 
+pub mod clipboard;
+pub mod config;
+pub mod identity_store;
+pub mod runner;
+
 /// The OS this binary runs on, if macwin supports it.
 pub fn host_os() -> Option<Os> {
     if cfg!(target_os = "macos") {
@@ -22,10 +27,8 @@ pub fn host_os() -> Option<Os> {
     }
 }
 
-/// A human-readable machine name from the environment.
+/// A human-readable name of this machine (the macOS computer name, the
+/// Windows computer name).
 pub fn device_name() -> String {
-    ["COMPUTERNAME", "HOSTNAME"]
-        .iter()
-        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
-        .unwrap_or_else(|| "unknown".into())
+    platform::device_name()
 }

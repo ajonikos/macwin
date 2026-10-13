@@ -4,7 +4,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use macwin_agent::cli::{Cli, Command, Probe, Spike};
+use macwin_agent::cli::{Cli, Command, ConfigCmd, Probe, Spike};
 use macwin_agent::{commands, logging};
 
 #[tokio::main]
@@ -23,6 +23,11 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Identity => commands::identity(),
+        Command::Pair(args) => commands::pair(args).await,
+        Command::Unpair => commands::unpair(),
+        Command::Config(ConfigCmd::Show) => commands::config_show(),
+        Command::Config(ConfigCmd::Set { key, value }) => commands::config_set(&key, &value),
+        Command::Run => commands::run().await,
         Command::Probe(Probe::Screens) => commands::probe_screens(),
         Command::Probe(Probe::Permissions { prompt }) => {
             commands::probe_permissions(prompt);

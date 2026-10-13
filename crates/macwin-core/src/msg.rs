@@ -5,10 +5,14 @@
 //! - control stream: session-level traffic (Hello, Heartbeat, Ping/Pong);
 //! - input stream: everything that must be totally ordered per direction
 //!   (Enter -> ModifierSync -> keys/buttons/wheel -> Leave, TakeControl);
-//! - datagrams: latest-wins cursor positions (`MouseAbs`).
+//! - datagrams: latest-wins cursor positions (`MouseAbs`);
+//! - clipboard streams: one unidirectional stream per [`ClipboardMsg`], so
+//!   a large text never delays heartbeats or input.
 //!
 //! `Ping`/`Pong` are accepted on every channel and answered on the channel
-//! they arrived on.
+//! they arrived on. Pairing ([`PairMsg`]) runs on its own connection.
+
+use std::fmt;
 
 use crate::types::{
     Hid, ModifierMask, MouseButton, Os, Point, RoleKind, ScreenInfo, Side, WheelUnit,
@@ -20,6 +24,8 @@ pub const CAP_INPUT_CAPTURE: &str = "input.capture";
 pub const CAP_INPUT_INJECT: &str = "input.inject";
 /// The sender runs the `spike net` latency tool.
 pub const CAP_SPIKE_NET: &str = "spike.net";
+/// The sender sends and accepts plain-text clipboard updates.
+pub const CAP_CLIPBOARD_TEXT: &str = "clipboard.text";
 
 /// Messages on the control stream.
 #[derive(Debug, Clone, PartialEq)]
@@ -149,4 +155,63 @@ pub struct MouseAbs {
     pub epoch: u64,
     pub seq: u64,
     pub at: Point,
+}
+
+/// Messages on clipboard streams (exactly one per unidirectional stream).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardMsg {
+    Text(ClipboardText),
+    /// The sender's clipboard changed to something macwin does not share
+    /// (an image, files, a password, too much text). Carries no content.
+    Other {
+        clock: u64,
+    },
+}
+
+/// The sender's clipboard now holds `text`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClipboardText {
+    /// Lamport clock of the change; orders concurrent updates (see
+    /// [`crate::clipboard`]).
+    pub clock: u64,
+    pub text: String,
+}
+
+/// Never prints the content, only its size.
+impl fmt::Debug for ClipboardText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClipboardText")
+            .field("clock", &self.clock)
+            .field("bytes", &self.text.len())
+            .finish()
+    }
+}
+
+/// Messages of the pairing exchange (ALPN `macwin-pair/1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairMsg {
+    Hello(PairHello),
+    Confirm(PairConfirm),
+    /// The dialer verified the listener's confirmation and saved the pairing.
+    Done,
+}
+
+/// First pairing message, sent by both sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairHello {
+    /// `major << 16 | minor`.
+    pub protocol_version: u32,
+    pub os: Os,
+    pub device_name: String,
+    pub agent_version: String,
+    /// The sender's "my peer is to my left/right", if the user chose it.
+    pub peer_side: Option<Side>,
+    /// The sender's SPAKE2 message.
+    pub spake: Vec<u8>,
+}
+
+/// Key confirmation: an HMAC over the pairing transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairConfirm {
+    pub mac: [u8; 32],
 }

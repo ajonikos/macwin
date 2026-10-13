@@ -1,23 +1,26 @@
 //! A machine's long-term identity: a self-signed certificate and its key.
 //!
-//! Phase 0 stores both as PEM files (`identity.crt.pem`, `identity.key.pem`)
-//! in the config directory, with mode 0600 inside a 0700 directory on Unix.
-//! TODO(Phase 1): move the key into the macOS Keychain / Windows DPAPI.
+//! The identity is persisted as a PEM bundle (certificate + PKCS#8 key)
+//! in a secret store chosen by the agent (macOS Keychain, Windows DPAPI or a
+//! private file). Phase 0 kept two PEM files in the config directory; the
+//! `legacy_*` functions read and remove them so the agent can migrate.
 
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::sign::CertifiedKey;
 
 use crate::NetError;
 use crate::fingerprint::Fingerprint;
 
-const CERT_FILE: &str = "identity.crt.pem";
-const KEY_FILE: &str = "identity.key.pem";
+/// Phase 0 certificate file in the config directory.
+pub const LEGACY_CERT_FILE: &str = "identity.crt.pem";
+/// Phase 0 private-key file in the config directory.
+pub const LEGACY_KEY_FILE: &str = "identity.key.pem";
 /// Subject alternative name of every macwin certificate (pinning, not names,
 /// is what authenticates peers).
 pub const CERT_NAME: &str = "macwin";
@@ -49,7 +52,36 @@ impl fmt::Debug for Identity {
 impl Identity {
     /// A fresh ECDSA P-256 self-signed identity.
     pub fn generate() -> Result<Identity, NetError> {
-        Ok(generate_with_pem()?.0)
+        Ok(Identity::generate_bundle()?.0)
+    }
+
+    /// A fresh identity and its PEM bundle (secret: it holds the key).
+    pub fn generate_bundle() -> Result<(Identity, String), NetError> {
+        let ck = rcgen::generate_simple_self_signed(vec![CERT_NAME.to_string()])
+            .map_err(|e| NetError::Identity(format!("cannot generate a certificate: {e}")))?;
+        let identity = Identity {
+            cert: ck.cert.der().clone(),
+            key: PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()),
+        };
+        let bundle = format!("{}{}", ck.cert.pem(), ck.signing_key.serialize_pem());
+        Ok((identity, bundle))
+    }
+
+    /// Parses a PEM bundle holding a CERTIFICATE and a PKCS#8 PRIVATE KEY
+    /// that belong together.
+    pub fn from_pem_bundle(pem: &[u8]) -> Result<Identity, NetError> {
+        let cert = CertificateDer::from_pem_slice(pem)
+            .map_err(|e| NetError::Identity(format!("no usable certificate: {e}")))?;
+        let key = PrivatePkcs8KeyDer::from_pem_slice(pem)
+            .map_err(|e| NetError::Identity(format!("no usable private key: {e}")))?;
+        let provider = rustls::crypto::ring::default_provider();
+        CertifiedKey::from_der(
+            vec![cert.clone()],
+            PrivateKeyDer::Pkcs8(key.clone_key()),
+            &provider,
+        )
+        .map_err(|e| NetError::Identity(format!("the key does not match the certificate: {e}")))?;
+        Ok(Identity { cert, key })
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
@@ -63,84 +95,48 @@ impl Identity {
     pub(crate) fn key(&self) -> PrivateKeyDer<'static> {
         PrivateKeyDer::Pkcs8(self.key.clone_key())
     }
+}
 
-    /// Loads the identity from `dir`, or creates and stores a new one.
-    /// Returns whether it was created. A directory holding only one of the
-    /// two files is an error: the identity is never silently replaced.
-    pub fn load_or_create(dir: &Path) -> Result<(Identity, bool), NetError> {
-        let cert_path = dir.join(CERT_FILE);
-        let key_path = dir.join(KEY_FILE);
-        match (cert_path.exists(), key_path.exists()) {
-            (true, true) => Ok((load(&cert_path, &key_path)?, false)),
-            (false, false) => {
-                create_private_dir(dir)?;
-                let (identity, cert_pem, key_pem) = generate_with_pem()?;
-                write_private(&key_path, key_pem.as_bytes())?;
-                write_private(&cert_path, cert_pem.as_bytes())?;
-                Ok((identity, true))
-            }
-            _ => Err(NetError::Identity(format!(
-                "incomplete identity in {}; remove it to regenerate",
-                dir.display()
-            ))),
+/// Reads a Phase 0 identity from `dir`: `Ok(None)` when neither file exists,
+/// the identity and its PEM bundle when both do, an error when only one
+/// does or they are unreadable.
+pub fn legacy_read(dir: &Path) -> Result<Option<(Identity, String)>, NetError> {
+    let cert_path = dir.join(LEGACY_CERT_FILE);
+    let key_path = dir.join(LEGACY_KEY_FILE);
+    match (cert_path.exists(), key_path.exists()) {
+        (false, false) => Ok(None),
+        (true, true) => {
+            let read = |p: &Path| {
+                fs::read_to_string(p)
+                    .map_err(|e| NetError::Identity(format!("cannot read {}: {e}", p.display())))
+            };
+            let bundle = format!("{}\n{}", read(&cert_path)?, read(&key_path)?);
+            let identity = Identity::from_pem_bundle(bundle.as_bytes()).map_err(|e| {
+                NetError::Identity(format!("bad identity files in {}: {e}", dir.display()))
+            })?;
+            Ok(Some((identity, bundle)))
         }
+        _ => Err(NetError::Identity(format!(
+            "incomplete identity files in {}; remove {LEGACY_CERT_FILE} and {LEGACY_KEY_FILE} to regenerate",
+            dir.display()
+        ))),
     }
 }
 
-fn generate_with_pem() -> Result<(Identity, String, String), NetError> {
-    let ck = rcgen::generate_simple_self_signed(vec![CERT_NAME.to_string()])
-        .map_err(|e| NetError::Identity(format!("cannot generate a certificate: {e}")))?;
-    let identity = Identity {
-        cert: ck.cert.der().clone(),
-        key: PrivatePkcs8KeyDer::from(ck.signing_key.serialize_der()),
-    };
-    Ok((identity, ck.cert.pem(), ck.signing_key.serialize_pem()))
-}
-
-fn load(cert_path: &Path, key_path: &Path) -> Result<Identity, NetError> {
-    let read = |p: &Path| {
-        fs::read(p).map_err(|e| NetError::Identity(format!("cannot read {}: {e}", p.display())))
-    };
-    let cert = CertificateDer::from_pem_slice(&read(cert_path)?).map_err(|e| {
-        NetError::Identity(format!("bad certificate in {}: {e}", cert_path.display()))
-    })?;
-    let key = PrivatePkcs8KeyDer::from_pem_slice(&read(key_path)?)
-        .map_err(|e| NetError::Identity(format!("bad key in {}: {e}", key_path.display())))?;
-    Ok(Identity { cert, key })
-}
-
-fn create_private_dir(dir: &Path) -> Result<(), NetError> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-        .create(dir)
-        .map_err(|e| NetError::Identity(format!("cannot create {}: {e}", dir.display())))
-}
-
-/// Writes `data` to a temporary file (mode 0600 on Unix) and renames it into
-/// place, so a crash never leaves a half-written file under the final name.
-fn write_private(path: &Path, data: &[u8]) -> Result<(), NetError> {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    let err =
-        |e: std::io::Error| NetError::Identity(format!("cannot write {}: {e}", path.display()));
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&tmp).map_err(err)?;
-    let written = file.write_all(data).and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err(e));
+/// Removes the Phase 0 identity files (after a verified migration).
+pub fn legacy_remove(dir: &Path) -> Result<(), NetError> {
+    for name in [LEGACY_KEY_FILE, LEGACY_CERT_FILE] {
+        let path = dir.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(NetError::Identity(format!(
+                    "cannot remove {}: {e}",
+                    path.display()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -267,53 +263,52 @@ mod tests {
     }
 
     #[test]
-    fn load_or_create_persists_and_reloads() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested").join("macwin");
-        let (first, created) = Identity::load_or_create(&path).unwrap();
-        assert!(created);
-        let (second, created) = Identity::load_or_create(&path).unwrap();
-        assert!(!created);
-        assert_eq!(first.fingerprint(), second.fingerprint());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode(&path), 0o700);
-            assert_eq!(mode(&path.join(KEY_FILE)), 0o600);
-            assert_eq!(mode(&path.join(CERT_FILE)), 0o600);
-        }
-        // No temporary files are left behind.
-        let names: Vec<_> = fs::read_dir(&path)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names.len(), 2, "{names:?}");
+    fn bundle_round_trip_and_mismatch() {
+        let (a, bundle) = Identity::generate_bundle().unwrap();
+        assert!(bundle.contains("BEGIN CERTIFICATE") && bundle.contains("BEGIN PRIVATE KEY"));
+        let back = Identity::from_pem_bundle(bundle.as_bytes()).unwrap();
+        assert_eq!(back.fingerprint(), a.fingerprint());
+        // A certificate with someone else's key is refused.
+        let (_, other) = Identity::generate_bundle().unwrap();
+        let cert_end = bundle.find("-----BEGIN PRIVATE KEY").unwrap();
+        let key_start = other.find("-----BEGIN PRIVATE KEY").unwrap();
+        let mixed = format!("{}{}", &bundle[..cert_end], &other[key_start..]);
+        let err = Identity::from_pem_bundle(mixed.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+        assert!(Identity::from_pem_bundle(b"garbage").is_err());
+        assert!(Identity::from_pem_bundle(&bundle.as_bytes()[..cert_end]).is_err());
     }
 
     #[test]
-    fn half_present_identity_is_an_error() {
+    fn legacy_files_are_read_and_removed() {
         let dir = tempfile::tempdir().unwrap();
-        Identity::load_or_create(dir.path()).unwrap();
-        fs::remove_file(dir.path().join(KEY_FILE)).unwrap();
-        let err = Identity::load_or_create(dir.path()).unwrap_err();
-        assert!(
-            matches!(&err, NetError::Identity(m) if m.contains("incomplete identity")),
-            "{err}"
+        assert!(legacy_read(dir.path()).unwrap().is_none());
+        let (id, bundle) = Identity::generate_bundle().unwrap();
+        let split = bundle.find("-----BEGIN PRIVATE KEY").unwrap();
+        fs::write(dir.path().join(LEGACY_CERT_FILE), &bundle[..split]).unwrap();
+        fs::write(dir.path().join(LEGACY_KEY_FILE), &bundle[split..]).unwrap();
+        let (read, read_bundle) = legacy_read(dir.path()).unwrap().unwrap();
+        assert_eq!(read.fingerprint(), id.fingerprint());
+        assert_eq!(
+            Identity::from_pem_bundle(read_bundle.as_bytes())
+                .unwrap()
+                .fingerprint(),
+            id.fingerprint()
         );
-        assert!(
-            !dir.path().join(KEY_FILE).exists(),
-            "never silently regenerated"
-        );
+        legacy_remove(dir.path()).unwrap();
+        legacy_remove(dir.path()).unwrap();
+        assert!(legacy_read(dir.path()).unwrap().is_none());
     }
 
     #[test]
-    fn corrupt_files_are_reported() {
+    fn half_present_or_corrupt_legacy_files_are_errors() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(CERT_FILE), "not pem").unwrap();
-        fs::write(dir.path().join(KEY_FILE), "not pem").unwrap();
+        fs::write(dir.path().join(LEGACY_CERT_FILE), "x").unwrap();
+        let err = legacy_read(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("incomplete"), "{err}");
+        fs::write(dir.path().join(LEGACY_KEY_FILE), "y").unwrap();
         assert!(matches!(
-            Identity::load_or_create(dir.path()),
+            legacy_read(dir.path()),
             Err(NetError::Identity(_))
         ));
     }

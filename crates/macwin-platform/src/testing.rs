@@ -1,7 +1,7 @@
 //! In-memory fakes of every backend trait, for driver and integration tests.
 //! All handles are `Clone` and thread-safe.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -10,7 +10,9 @@ use macwin_core::types::{
 };
 
 use crate::{
-    CaptureControl, CaptureSink, InputCapture, InputInjector, PlatformError, ScreenSource,
+    CLIPBOARD_ORIGIN_FORMAT, CaptureControl, CaptureSink, ClipboardBackend, ClipboardFormat,
+    ClipboardInfo, ClipboardSnapshot, InputCapture, InputInjector, LocalClipboard, PlatformError,
+    ScreenSource, SecretStore, check_secret_name,
 };
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -24,6 +26,8 @@ struct CaptureState {
     commands: Vec<GrabCommand>,
     lease: Option<Instant>,
     stopped: bool,
+    /// The backend was dropped (real backends stop capturing then).
+    dropped: bool,
 }
 
 /// Fake capture backend. Create with [`FakeCapture::new`] and drive it
@@ -66,6 +70,21 @@ impl InputCapture for FakeCapture {
     }
 }
 
+/// Like the real backends, dropping the fake ends its capture: events
+/// emitted afterwards are a test failure.
+impl Drop for FakeCapture {
+    fn drop(&mut self) {
+        let sink = {
+            let mut s = lock(&self.state);
+            s.dropped = true;
+            s.stopped = true;
+            s.sink.take()
+        };
+        // Released outside the lock: the sink may own the last session state.
+        drop(sink);
+    }
+}
+
 impl CaptureControl for FakeControl {
     fn command(&self, cmd: GrabCommand) {
         lock(&self.state).commands.push(cmd);
@@ -91,13 +110,30 @@ impl FakeCaptureHandle {
     /// Feeds a physical event to the sink, like a capture thread would, and
     /// returns its deliver/swallow decision. No internal lock is held while
     /// the sink runs, so the sink may call back into the control.
+    ///
+    /// Panics when the backend was already dropped: a real capture thread
+    /// would have stopped.
     pub fn emit(&self, ev: CapturedEvent) -> bool {
+        assert!(
+            !self.backend_dropped(),
+            "event emitted after the capture backend was dropped"
+        );
         self.sink().on_event(ev)
     }
 
     /// Reports a fault to the sink.
     pub fn emit_fault(&self, fault: CaptureFault) {
+        assert!(
+            !self.backend_dropped(),
+            "fault emitted after the capture backend was dropped"
+        );
         self.sink().on_fault(fault);
+    }
+
+    /// True once the [`FakeCapture`] itself was dropped (it then releases
+    /// its sink, like a real backend whose thread ended).
+    pub fn backend_dropped(&self) -> bool {
+        lock(&self.state).dropped
     }
 
     pub fn started(&self) -> bool {
@@ -224,6 +260,219 @@ impl ScreenSource for FakeScreens {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum FakeContent {
+    #[default]
+    Empty,
+    Text(String),
+    Sensitive(String),
+    Image,
+}
+
+#[derive(Default)]
+struct ClipboardState {
+    count: u64,
+    content: FakeContent,
+    ours: bool,
+    writes: Vec<String>,
+    text_reads: usize,
+}
+
+/// Fake system clipboard with macwin's origin-marker semantics.
+pub struct FakeClipboard {
+    state: Arc<Mutex<ClipboardState>>,
+}
+
+/// Test-side handle of a [`FakeClipboard`]: plays the user and other apps.
+#[derive(Clone)]
+pub struct FakeClipboardHandle {
+    state: Arc<Mutex<ClipboardState>>,
+}
+
+impl FakeClipboard {
+    pub fn new() -> (FakeClipboard, FakeClipboardHandle) {
+        let state = Arc::new(Mutex::new(ClipboardState::default()));
+        (
+            FakeClipboard {
+                state: state.clone(),
+            },
+            FakeClipboardHandle { state },
+        )
+    }
+}
+
+impl FakeClipboardHandle {
+    fn set(&self, content: FakeContent) {
+        let mut s = lock(&self.state);
+        s.count += 1;
+        s.content = content;
+        s.ours = false;
+    }
+
+    /// The user copies text in another app.
+    pub fn copy_text(&self, text: &str) {
+        self.set(FakeContent::Text(text.into()));
+    }
+
+    /// A password manager copies a concealed text.
+    pub fn copy_sensitive(&self, text: &str) {
+        self.set(FakeContent::Sensitive(text.into()));
+    }
+
+    /// The user copies an image.
+    pub fn copy_image(&self) {
+        self.set(FakeContent::Image);
+    }
+
+    /// A clipboard manager re-copies the current content without macwin's
+    /// origin marker.
+    pub fn recopy(&self) {
+        let content = lock(&self.state).content.clone();
+        self.set(content);
+    }
+
+    /// The plain text on the clipboard (sensitive text included).
+    pub fn text(&self) -> Option<String> {
+        match &lock(&self.state).content {
+            FakeContent::Text(t) | FakeContent::Sensitive(t) => Some(t.clone()),
+            FakeContent::Empty | FakeContent::Image => None,
+        }
+    }
+
+    /// Every text macwin wrote, in order.
+    pub fn writes(&self) -> Vec<String> {
+        lock(&self.state).writes.clone()
+    }
+
+    /// How many times macwin read text content.
+    pub fn text_reads(&self) -> usize {
+        lock(&self.state).text_reads
+    }
+
+    pub fn change_count(&self) -> u64 {
+        lock(&self.state).count
+    }
+}
+
+impl ClipboardBackend for FakeClipboard {
+    fn change_count(&self) -> Result<u64, PlatformError> {
+        Ok(lock(&self.state).count)
+    }
+
+    fn inspect(&self) -> Result<ClipboardInfo, PlatformError> {
+        let s = lock(&self.state);
+        let mut formats = Vec::new();
+        match &s.content {
+            FakeContent::Empty => {}
+            FakeContent::Text(t) => formats.push(ClipboardFormat {
+                name: "text".into(),
+                size: Some(t.len()),
+            }),
+            FakeContent::Sensitive(t) => {
+                formats.push(ClipboardFormat {
+                    name: "text".into(),
+                    size: Some(t.len()),
+                });
+                formats.push(ClipboardFormat {
+                    name: crate::MAC_SENSITIVE_TYPES[0].into(),
+                    size: Some(0),
+                });
+            }
+            FakeContent::Image => formats.push(ClipboardFormat {
+                name: "image".into(),
+                size: None,
+            }),
+        }
+        if s.ours {
+            formats.push(ClipboardFormat {
+                name: CLIPBOARD_ORIGIN_FORMAT.into(),
+                size: Some(1),
+            });
+        }
+        Ok(ClipboardInfo {
+            change_count: s.count,
+            formats,
+            ours: s.ours,
+        })
+    }
+
+    fn read_text(&self) -> Result<Option<String>, PlatformError> {
+        let mut s = lock(&self.state);
+        s.text_reads += 1;
+        Ok(match &s.content {
+            FakeContent::Text(t) | FakeContent::Sensitive(t) => Some(t.clone()),
+            FakeContent::Empty | FakeContent::Image => None,
+        })
+    }
+
+    fn snapshot(&self, max_text_bytes: usize) -> Result<ClipboardSnapshot, PlatformError> {
+        let mut s = lock(&self.state);
+        let content = if s.ours {
+            LocalClipboard::Ours
+        } else {
+            match s.content.clone() {
+                FakeContent::Sensitive(_) => LocalClipboard::Sensitive,
+                FakeContent::Empty | FakeContent::Image => LocalClipboard::NoText,
+                FakeContent::Text(t) if t.len() > max_text_bytes => {
+                    LocalClipboard::TooLarge { bytes: t.len() }
+                }
+                FakeContent::Text(t) => {
+                    s.text_reads += 1;
+                    LocalClipboard::Text(t)
+                }
+            }
+        };
+        Ok(ClipboardSnapshot {
+            change_count: s.count,
+            content,
+        })
+    }
+
+    fn write_text(&self, text: &str) -> Result<u64, PlatformError> {
+        let mut s = lock(&self.state);
+        s.count += 1;
+        s.content = FakeContent::Text(text.into());
+        s.ours = true;
+        s.writes.push(text.into());
+        Ok(s.count)
+    }
+}
+
+/// In-memory [`SecretStore`]; clones share the same secrets.
+#[derive(Debug, Clone, Default)]
+pub struct MemorySecretStore {
+    secrets: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+}
+
+impl MemorySecretStore {
+    pub fn new() -> MemorySecretStore {
+        MemorySecretStore::default()
+    }
+}
+
+impl SecretStore for MemorySecretStore {
+    fn load(&self, name: &str) -> Result<Option<Vec<u8>>, PlatformError> {
+        check_secret_name(name)?;
+        Ok(lock(&self.secrets).get(name).cloned())
+    }
+
+    fn store(&self, name: &str, secret: &[u8]) -> Result<(), PlatformError> {
+        check_secret_name(name)?;
+        lock(&self.secrets).insert(name.into(), secret.to_vec());
+        Ok(())
+    }
+
+    fn delete(&self, name: &str) -> Result<(), PlatformError> {
+        check_secret_name(name)?;
+        lock(&self.secrets).remove(name);
+        Ok(())
+    }
+
+    fn describe(&self, name: &str) -> String {
+        format!("memory ({name})")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
@@ -339,6 +588,42 @@ mod tests {
         assert_eq!(handle.commands().len(), 6);
         handle.clear();
         assert!(handle.commands().is_empty());
+    }
+
+    #[test]
+    fn fake_clipboard_classifies_like_a_real_backend() {
+        let (cb, user) = FakeClipboard::new();
+        let snap = |cb: &FakeClipboard| cb.snapshot(5).unwrap().content;
+        assert_eq!(snap(&cb), LocalClipboard::NoText);
+        user.copy_text("hello");
+        assert_eq!(snap(&cb), LocalClipboard::Text("hello".into()));
+        user.copy_text("longer");
+        assert_eq!(snap(&cb), LocalClipboard::TooLarge { bytes: 6 });
+        user.copy_sensitive("pw");
+        assert_eq!(snap(&cb), LocalClipboard::Sensitive);
+        user.copy_image();
+        assert_eq!(snap(&cb), LocalClipboard::NoText);
+        let reads = user.text_reads();
+        let count = cb.write_text("abc").unwrap();
+        assert_eq!(count, user.change_count());
+        assert_eq!(snap(&cb), LocalClipboard::Ours);
+        assert_eq!(user.text_reads(), reads, "own writes are never read");
+        assert!(cb.inspect().unwrap().ours);
+        user.recopy();
+        assert_eq!(snap(&cb), LocalClipboard::Text("abc".into()));
+        assert_eq!(user.writes(), vec!["abc".to_string()]);
+        assert_eq!(cb.read_text().unwrap().as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn memory_secret_store_is_shared_between_clones() {
+        let a = MemorySecretStore::new();
+        let b = a.clone();
+        a.store("identity", b"k").unwrap();
+        assert_eq!(b.load("identity").unwrap().as_deref(), Some(&b"k"[..]));
+        b.delete("identity").unwrap();
+        assert_eq!(a.load("identity").unwrap(), None);
+        assert!(a.store("../x", b"k").is_err());
     }
 
     #[test]

@@ -78,6 +78,82 @@ pub mod datagram_frame {
     }
 }
 
+/// The body of one clipboard stream (after its type byte, no length
+/// prefix: the stream ends where the message ends).
+#[derive(Clone, PartialEq, Message)]
+pub struct ClipboardFrame {
+    #[prost(oneof = "clipboard_frame::Kind", tags = "1, 2")]
+    pub kind: Option<clipboard_frame::Kind>,
+}
+
+pub mod clipboard_frame {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "1")]
+        Text(super::ClipboardText),
+        #[prost(message, tag = "2")]
+        Other(super::ClipboardOther),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct ClipboardOther {
+    #[prost(uint64, tag = "1")]
+    pub clock: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClipboardText {
+    #[prost(uint64, tag = "1")]
+    pub clock: u64,
+    #[prost(string, tag = "2")]
+    pub text: String,
+}
+
+/// One frame on the pairing stream.
+#[derive(Clone, PartialEq, Message)]
+pub struct PairFrame {
+    #[prost(oneof = "pair_frame::Kind", tags = "1, 2, 3")]
+    pub kind: Option<pair_frame::Kind>,
+}
+
+pub mod pair_frame {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "1")]
+        Hello(super::PairHello),
+        #[prost(message, tag = "2")]
+        Confirm(super::PairConfirm),
+        #[prost(message, tag = "3")]
+        Done(super::PairDone),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PairHello {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(enumeration = "Os", tag = "2")]
+    pub os: i32,
+    #[prost(string, tag = "3")]
+    pub device_name: String,
+    #[prost(string, tag = "4")]
+    pub agent_version: String,
+    #[prost(enumeration = "Side", tag = "5")]
+    pub peer_side: i32,
+    #[prost(bytes = "vec", tag = "6")]
+    pub spake: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PairConfirm {
+    #[prost(bytes = "vec", tag = "1")]
+    pub mac: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Message)]
+pub struct PairDone {}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct Hello {
     #[prost(uint32, tag = "1")]

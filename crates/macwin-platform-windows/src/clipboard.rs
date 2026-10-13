@@ -6,7 +6,8 @@ use std::thread;
 use std::time::Duration;
 
 use macwin_platform::{
-    CLIPBOARD_ORIGIN_FORMAT, ClipboardBackend, ClipboardFormat, ClipboardInfo, PlatformError,
+    CLIPBOARD_ORIGIN_FORMAT, ClipboardBackend, ClipboardFormat, ClipboardInfo, ClipboardSnapshot,
+    LocalClipboard, PlatformError, WIN_CLOUD_FORMAT, WIN_SENSITIVE_FORMATS,
 };
 use windows_sys::Win32::Foundation::{GlobalFree, HWND};
 use windows_sys::Win32::System::DataExchange::{
@@ -28,10 +29,86 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn origin_format() -> u32 {
-    let name = wide(CLIPBOARD_ORIGIN_FORMAT);
+/// The id of a registered format (registering is idempotent system-wide).
+fn registered(name: &str) -> u32 {
+    let name = wide(name);
     // SAFETY: NUL-terminated UTF-16 buffer.
     unsafe { RegisterClipboardFormatW(name.as_ptr()) }
+}
+
+fn origin_format() -> u32 {
+    registered(CLIPBOARD_ORIGIN_FORMAT)
+}
+
+/// Format availability; does not open the clipboard.
+fn available(format: u32) -> bool {
+    // SAFETY: plain query.
+    format != 0 && unsafe { IsClipboardFormatAvailable(format) } != 0
+}
+
+/// Plain text read from an open clipboard.
+enum TextRead {
+    Missing,
+    TooLarge(usize),
+    Text(String),
+}
+
+/// Reads CF_UNICODETEXT, refusing texts over `max_bytes` UTF-8 bytes
+/// before converting them when the UTF-16 length already exceeds it.
+///
+/// # Safety
+/// The clipboard must be open on this thread.
+unsafe fn read_open_text(max_bytes: usize) -> TextRead {
+    // SAFETY: the clipboard is open (caller); CF_UNICODETEXT is an HGLOBAL
+    // holding NUL-terminated UTF-16 within GlobalSize bytes.
+    unsafe {
+        let h = GetClipboardData(u32::from(CF_UNICODETEXT));
+        if h.is_null() {
+            return TextRead::Missing;
+        }
+        let p = GlobalLock(h) as *const u16;
+        if p.is_null() {
+            return TextRead::Missing;
+        }
+        let max_units = GlobalSize(h) / 2;
+        let units = std::slice::from_raw_parts(p, max_units);
+        let len = units.iter().position(|&c| c == 0).unwrap_or(max_units);
+        // Every UTF-16 unit is at least one UTF-8 byte.
+        let read = if len > max_bytes {
+            TextRead::TooLarge(len)
+        } else {
+            let text = String::from_utf16_lossy(&units[..len]);
+            if text.len() > max_bytes {
+                TextRead::TooLarge(text.len())
+            } else {
+                TextRead::Text(text)
+            }
+        };
+        GlobalUnlock(h);
+        read
+    }
+}
+
+/// The DWORD of a format such as `CanUploadToCloudClipboard`.
+///
+/// # Safety
+/// The clipboard must be open on this thread.
+unsafe fn read_open_dword(format: u32) -> Option<u32> {
+    // SAFETY: the clipboard is open (caller); the handle is an HGLOBAL and
+    // at least 4 bytes are checked before reading.
+    unsafe {
+        let h = GetClipboardData(format);
+        if h.is_null() || GlobalSize(h) < 4 {
+            return None;
+        }
+        let p = GlobalLock(h) as *const u8;
+        if p.is_null() {
+            return None;
+        }
+        let value = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
+        GlobalUnlock(h);
+        Some(value)
+    }
 }
 
 /// Closes the clipboard when dropped.
@@ -137,33 +214,50 @@ impl ClipboardBackend for WinClipboard {
     }
 
     fn read_text(&self) -> Result<Option<String>, PlatformError> {
-        let format = u32::from(CF_UNICODETEXT);
-        // SAFETY: plain query.
-        if unsafe { IsClipboardFormatAvailable(format) } == 0 {
+        if !available(u32::from(CF_UNICODETEXT)) {
             return Ok(None);
         }
         let _open = Open::new(ptr::null_mut())?;
-        // SAFETY: the clipboard is open; CF_UNICODETEXT is an HGLOBAL holding
-        // NUL-terminated UTF-16 within GlobalSize bytes.
-        unsafe {
-            let h = GetClipboardData(format);
-            if h.is_null() {
-                return Ok(None);
-            }
-            let p = GlobalLock(h) as *const u16;
-            if p.is_null() {
-                return Ok(None);
-            }
-            let max = GlobalSize(h) / 2;
-            let slice = std::slice::from_raw_parts(p, max);
-            let len = slice.iter().position(|&c| c == 0).unwrap_or(max);
-            let text = String::from_utf16_lossy(&slice[..len]);
-            GlobalUnlock(h);
-            Ok(Some(text))
-        }
+        // SAFETY: the clipboard is open on this thread.
+        Ok(match unsafe { read_open_text(usize::MAX) } {
+            TextRead::Text(t) => Some(t),
+            TextRead::Missing | TextRead::TooLarge(_) => None,
+        })
     }
 
-    fn write_text(&self, text: &str) -> Result<(), PlatformError> {
+    fn snapshot(&self, max_text_bytes: usize) -> Result<ClipboardSnapshot, PlatformError> {
+        let change_count = self.change_count()?;
+        let content = if available(origin_format()) {
+            LocalClipboard::Ours
+        } else if WIN_SENSITIVE_FORMATS
+            .iter()
+            .any(|name| available(registered(name)))
+        {
+            LocalClipboard::Sensitive
+        } else if !available(u32::from(CF_UNICODETEXT)) {
+            LocalClipboard::NoText
+        } else {
+            let cloud = registered(WIN_CLOUD_FORMAT);
+            let _open = Open::new(ptr::null_mut())?;
+            // SAFETY: the clipboard is open on this thread.
+            if available(cloud) && unsafe { read_open_dword(cloud) } == Some(0) {
+                LocalClipboard::Sensitive
+            } else {
+                // SAFETY: the clipboard is open on this thread.
+                match unsafe { read_open_text(max_text_bytes) } {
+                    TextRead::Missing => LocalClipboard::NoText,
+                    TextRead::TooLarge(bytes) => LocalClipboard::TooLarge { bytes },
+                    TextRead::Text(t) => LocalClipboard::Text(t),
+                }
+            }
+        };
+        Ok(ClipboardSnapshot {
+            change_count,
+            content,
+        })
+    }
+
+    fn write_text(&self, text: &str) -> Result<u64, PlatformError> {
         let data = wide(text);
         let class = wide("STATIC");
         // SAFETY: a message-only window owns the clipboard while we write
@@ -215,7 +309,8 @@ impl ClipboardBackend for WinClipboard {
                 Ok(())
             })();
             DestroyWindow(owner);
-            result
+            result?;
         }
+        self.change_count()
     }
 }

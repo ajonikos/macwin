@@ -10,7 +10,9 @@ use macwin_net::Fingerprint;
 #[command(
     name = "macwin",
     version,
-    about = "Software KVM between a Mac and a Windows PC on one LAN (Phase 0: spikes)"
+    about = "Share one keyboard, mouse and clipboard between a Mac and a Windows PC on one LAN",
+    after_help = "Getting started: run `macwin pair` on one machine; it shows a code and the command\n\
+                  to type on the other machine. Then run `macwin run` on both."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -19,14 +21,52 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Print this machine's identity fingerprint (created on first use).
+    /// Print this machine's identity fingerprint and where its key is kept
+    /// (created on first use).
     Identity,
+    /// Pair with the other machine using a one-time code.
+    Pair(PairArgs),
+    /// Forget the paired machine.
+    Unpair,
+    /// Show or change the configuration.
+    #[command(subcommand)]
+    Config(ConfigCmd),
+    /// Share the keyboard, mouse and clipboard with the paired machine and
+    /// reconnect whenever the connection drops (Ctrl+C to stop).
+    Run,
     /// Read-only checks of this machine.
     #[command(subcommand)]
     Probe(Probe),
     /// Experimental tools.
     #[command(subcommand)]
     Spike(Spike),
+}
+
+#[derive(Debug, Args)]
+pub struct PairArgs {
+    /// The other machine's address (HOST or HOST:PORT), as printed by its
+    /// `macwin pair`. Without it, this machine waits and shows a code.
+    #[arg(value_name = "HOST[:PORT]")]
+    pub address: Option<String>,
+    /// The code shown on the other machine (asked for when omitted).
+    #[arg(long, requires = "address")]
+    pub code: Option<String>,
+    /// Which side of this machine the other machine's screens are on.
+    #[arg(long, value_enum)]
+    pub side: Option<SideArg>,
+    /// Wait on ADDR:PORT instead of the configured listen address.
+    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "address")]
+    pub listen: Option<SocketAddr>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCmd {
+    /// Print the configuration.
+    Show,
+    /// Change one setting. Keys: side (left|right|none), address
+    /// (HOST[:PORT]|none), listen (ADDR:PORT), remap (on|off), clipboard
+    /// (on|off), clipboard-max-kb (1-16384).
+    Set { key: String, value: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -266,6 +306,51 @@ mod tests {
             "--demo is required"
         );
         assert!(Cli::try_parse_from(["macwin", "spike", "inject", "--demo"]).is_ok());
+    }
+
+    #[test]
+    fn pair_config_and_run_parse() {
+        let parse = |args: &[&str]| {
+            let mut v = vec!["macwin"];
+            v.extend_from_slice(args);
+            Cli::try_parse_from(v)
+        };
+        match parse(&["pair"]).unwrap().command {
+            Command::Pair(a) => assert!(a.address.is_none() && a.code.is_none()),
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&["pair", "pc.local", "--code", "123-456", "--side", "right"])
+            .unwrap()
+            .command
+        {
+            Command::Pair(a) => {
+                assert_eq!(a.address.as_deref(), Some("pc.local"));
+                assert_eq!(a.code.as_deref(), Some("123-456"));
+                assert_eq!(a.side, Some(SideArg::Right));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            parse(&["pair", "--code", "123456"]).is_err(),
+            "a code needs an address"
+        );
+        assert!(
+            parse(&["pair", "pc", "--listen", "0.0.0.0:1"]).is_err(),
+            "dial or wait, not both"
+        );
+        assert!(matches!(
+            parse(&["config", "set", "side", "left"]).unwrap().command,
+            Command::Config(ConfigCmd::Set { .. })
+        ));
+        assert!(matches!(
+            parse(&["config", "show"]).unwrap().command,
+            Command::Config(ConfigCmd::Show)
+        ));
+        assert!(matches!(parse(&["run"]).unwrap().command, Command::Run));
+        assert!(matches!(
+            parse(&["unpair"]).unwrap().command,
+            Command::Unpair
+        ));
     }
 
     #[test]

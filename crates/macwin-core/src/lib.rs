@@ -1,11 +1,12 @@
 //! OS-independent core of macwin: domain vocabulary, edge-mapping geometry,
 //! the generated HID keymap, modifier remapping, pressed-key tracking,
-//! heartbeat timing, the emergency-chord detector and the controller state
-//! machine (the [`Engine`]).
+//! heartbeat timing, the emergency-chord detector, the controller state
+//! machine (the [`Engine`]) and clipboard synchronisation.
 //!
 //! Pure Rust: no I/O, no threads and no clocks (time is always passed in).
 #![forbid(unsafe_code)]
 
+pub mod clipboard;
 pub mod engine;
 pub mod geometry;
 pub mod heartbeat;

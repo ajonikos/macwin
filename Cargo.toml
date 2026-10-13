@@ -38,11 +38,14 @@ anyhow = "=1.0.104"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "ansi", "env-filter", "std"] }
 clap = { version = "=4.6.7", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+toml = "=1.1.8"
 tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
 ring = "=0.17.14"
+spake2 = "=0.4.0"
 libc = "=0.2.190"
 objc2 = "=0.6.5"
 objc2-core-foundation = { version = "=0.3.2", default-features = false, features = [
@@ -67,9 +70,11 @@ objc2-core-graphics = { version = "=0.3.2", default-features = false, features =
 ] }
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSEvent", "NSPasteboard"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSProcessInfo", "NSString"] }
+security-framework = { version = "=3.7.0", default-features = false }
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Security_Cryptography",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",

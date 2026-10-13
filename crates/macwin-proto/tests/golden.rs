@@ -1,12 +1,33 @@
 //! Golden bytes: these lock the wire format. If one of them changes, peers of
 //! different versions stop understanding each other.
 
-use macwin_core::msg::{ControlMsg, DatagramMsg, Heartbeat, InputMsg, KeyMsg, MouseAbs};
+use macwin_core::msg::{
+    ClipboardMsg, ClipboardText, ControlMsg, DatagramMsg, Heartbeat, InputMsg, KeyMsg, MouseAbs,
+    PairMsg,
+};
 use macwin_core::types::{Hid, Point, RoleKind};
 use macwin_proto::{
-    decode_control, decode_datagram, decode_input, encode_control, encode_datagram, encode_input,
-    frame,
+    decode_clipboard, decode_control, decode_datagram, decode_input, decode_pair, encode_clipboard,
+    encode_control, encode_datagram, encode_input, encode_pair, frame,
 };
+
+#[test]
+fn clipboard_text() {
+    let m = ClipboardMsg::Text(ClipboardText {
+        clock: 1,
+        text: "hi".into(),
+    });
+    let bytes = encode_clipboard(&m);
+    assert_eq!(bytes, [0x0A, 0x06, 0x08, 0x01, 0x12, 0x02, 0x68, 0x69]);
+    assert_eq!(decode_clipboard(&bytes).unwrap(), m);
+}
+
+#[test]
+fn pair_done() {
+    let bytes = encode_pair(&PairMsg::Done);
+    assert_eq!(bytes, [0x1A, 0x00]);
+    assert_eq!(decode_pair(&bytes).unwrap(), PairMsg::Done);
+}
 
 #[test]
 fn key_a_down() {

@@ -10,13 +10,23 @@ mod convert;
 pub mod frame;
 pub mod wire;
 
-use macwin_core::msg::{ControlMsg, DatagramMsg, InputMsg};
+use macwin_core::msg::{ClipboardMsg, ControlMsg, DatagramMsg, InputMsg, PairMsg};
 use prost::Message;
 
 /// `major << 16 | minor`. Peers with a different major refuse each other.
-pub const PROTOCOL_VERSION: u32 = 0x0001_0000;
-/// Largest frame body, for streams and datagrams.
+/// Minor 1 added clipboard streams (capability `clipboard.text`) and pairing.
+pub const PROTOCOL_VERSION: u32 = 0x0001_0001;
+/// Largest frame body on the control and input streams, the pairing stream
+/// and in datagrams.
 pub const MAX_FRAME_LEN: usize = 64 * 1024;
+/// Largest clipboard text accepted on the wire, in UTF-8 bytes.
+pub const MAX_CLIPBOARD_TEXT: usize = 16 * 1024 * 1024;
+/// Largest encoded [`ClipboardMsg`] (the text plus protobuf overhead).
+pub const MAX_CLIPBOARD_FRAME: usize = MAX_CLIPBOARD_TEXT + 64;
+/// Length of a SPAKE2 (Ed25519) message.
+pub const SPAKE_MSG_LEN: usize = 33;
+/// Length of a pairing key-confirmation MAC (HMAC-SHA256).
+pub const PAIR_MAC_LEN: usize = 32;
 /// Largest accepted string field, in bytes.
 pub const MAX_STRING_LEN: usize = 256;
 /// Most capabilities accepted in a Hello.
@@ -87,6 +97,36 @@ pub fn encode_datagram(m: &DatagramMsg) -> Vec<u8> {
 
 pub fn decode_datagram(b: &[u8]) -> Result<DatagramMsg, ProtoError> {
     convert::datagram_from_wire(wire::DatagramFrame::decode(b)?)
+}
+
+pub fn encode_clipboard(m: &ClipboardMsg) -> Vec<u8> {
+    convert::clipboard_to_wire(m).encode_to_vec()
+}
+
+/// True when the peer will accept `m` ([`decode_clipboard`]'s limits).
+pub fn clipboard_within_limits(m: &ClipboardMsg) -> bool {
+    match m {
+        ClipboardMsg::Text(t) => t.text.len() <= MAX_CLIPBOARD_TEXT,
+        ClipboardMsg::Other { .. } => true,
+    }
+}
+
+pub fn decode_clipboard(b: &[u8]) -> Result<ClipboardMsg, ProtoError> {
+    if b.len() > MAX_CLIPBOARD_FRAME {
+        return Err(ProtoError::InvalidValue {
+            field: "clipboard frame",
+            reason: "frame larger than the clipboard limit",
+        });
+    }
+    convert::clipboard_from_wire(wire::ClipboardFrame::decode(b)?)
+}
+
+pub fn encode_pair(m: &PairMsg) -> Vec<u8> {
+    convert::pair_to_wire(m).encode_to_vec()
+}
+
+pub fn decode_pair(b: &[u8]) -> Result<PairMsg, ProtoError> {
+    convert::pair_from_wire(wire::PairFrame::decode(b)?)
 }
 
 #[cfg(test)]

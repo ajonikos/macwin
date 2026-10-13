@@ -7,7 +7,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use macwin_agent::driver::{
-    Backends, Connected, SessionConfig, SessionEnd, SessionHandle, kvm_hello, spawn_session,
+    Backends, ClipboardSettings, Connected, SessionConfig, SessionEnd, SessionHandle, kvm_hello,
+    spawn_session,
 };
 use macwin_core::engine::{Timings, TransportRole};
 use macwin_core::msg::{ButtonMsg, Enter, InputMsg, KeyMsg};
@@ -17,7 +18,8 @@ use macwin_core::types::{
 };
 use macwin_net::{Identity, Session, codes, connect, listen};
 use macwin_platform::testing::{
-    FakeCapture, FakeCaptureHandle, FakeInjector, FakeInjectorHandle, FakeScreens,
+    FakeCapture, FakeCaptureHandle, FakeClipboard, FakeClipboardHandle, FakeInjector,
+    FakeInjectorHandle, FakeScreens,
 };
 
 const T: Duration = Duration::from_secs(5);
@@ -44,7 +46,16 @@ fn cfg(os: Os, name: &str, side: Side) -> SessionConfig {
         peer_side: side,
         remap: true,
         timings: Timings::default(),
+        clipboard: None,
     }
+}
+
+/// Clipboard sharing with a fast poll for tests.
+fn sharing(max_text_bytes: usize) -> Option<ClipboardSettings> {
+    Some(ClipboardSettings {
+        max_text_bytes,
+        poll: Duration::from_millis(5),
+    })
 }
 
 fn mac_cfg() -> SessionConfig {
@@ -59,6 +70,7 @@ struct Peer {
     handle: SessionHandle,
     capture: FakeCaptureHandle,
     injector: FakeInjectorHandle,
+    clipboard: FakeClipboardHandle,
 }
 
 impl Peer {
@@ -75,10 +87,12 @@ fn spawn_peer(
 ) -> Peer {
     let (capture, capture_handle) = FakeCapture::new();
     let (injector, injector_handle) = FakeInjector::new();
+    let (clipboard, clipboard_handle) = FakeClipboard::new();
     let backends = Backends {
         capture: Box::new(capture),
         injector: Box::new(injector),
         screens: Box::new(FakeScreens(scr)),
+        clipboard: Some(Box::new(clipboard)),
     };
     let handle = spawn_session(
         cfg,
@@ -94,6 +108,7 @@ fn spawn_peer(
         handle,
         capture: capture_handle,
         injector: injector_handle,
+        clipboard: clipboard_handle,
     }
 }
 
@@ -121,15 +136,19 @@ async fn sessions(
 }
 
 async fn start() -> (Peer, Peer) {
-    let a_hello = kvm_hello(&mac_cfg(), screens(1440, 900));
-    let b_hello = kvm_hello(&win_cfg(), screens(1920, 1080));
+    start_with(mac_cfg(), win_cfg()).await
+}
+
+async fn start_with(a_cfg: SessionConfig, b_cfg: SessionConfig) -> (Peer, Peer) {
+    let a_hello = kvm_hello(&a_cfg, screens(1440, 900));
+    let b_hello = kvm_hello(&b_cfg, screens(1920, 1080));
     let (a, b) = sessions(a_hello.clone(), b_hello.clone()).await;
     // 1. Each side sees exactly the other's Hello.
     assert_eq!(a.peer, b_hello);
     assert_eq!(b.peer, a_hello);
     (
-        spawn_peer(mac_cfg(), screens(1440, 900), a, TransportRole::Dialer),
-        spawn_peer(win_cfg(), screens(1920, 1080), b, TransportRole::Listener),
+        spawn_peer(a_cfg, screens(1440, 900), a, TransportRole::Dialer),
+        spawn_peer(b_cfg, screens(1920, 1080), b, TransportRole::Listener),
     )
 }
 
@@ -381,4 +400,90 @@ async fn shutdown_while_controlling_releases_the_peer() {
     let b_end = tokio::time::timeout(T, b.handle.join()).await.unwrap();
     assert_eq!(b_end, SessionEnd::PeerClosed);
     assert_eq!(b.injector.unmatched_ups(), 0);
+}
+
+fn with_clipboard(mut c: SessionConfig, max: usize) -> SessionConfig {
+    c.clipboard = sharing(max);
+    c
+}
+
+/// Long enough for several clipboard polls and a round trip.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_text_crosses_both_ways_without_echo() {
+    let (a, b) = start_with(
+        with_clipboard(mac_cfg(), 1024),
+        with_clipboard(win_cfg(), 1024),
+    )
+    .await;
+    a.clipboard.copy_text("hello from the mac");
+    wait_until("B got the text", || {
+        b.clipboard.text().as_deref() == Some("hello from the mac")
+    })
+    .await;
+    b.clipboard.copy_text("привет с ПК");
+    wait_until("A got the text", || {
+        a.clipboard.text().as_deref() == Some("привет с ПК")
+    })
+    .await;
+    settle().await;
+    // Each side wrote exactly once: no echo, no loop.
+    assert_eq!(a.clipboard.writes(), vec!["привет с ПК".to_string()]);
+    assert_eq!(b.clipboard.writes(), vec!["hello from the mac".to_string()]);
+    // A clipboard manager re-copying the received text does not bounce it back.
+    a.clipboard.recopy();
+    settle().await;
+    assert_eq!(b.clipboard.writes().len(), 1);
+    a.handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn private_large_and_non_text_content_is_not_shared() {
+    let (a, b) = start_with(with_clipboard(mac_cfg(), 8), with_clipboard(win_cfg(), 8)).await;
+    a.clipboard.copy_sensitive("hunter2");
+    a.clipboard.copy_text("way over the 8-byte limit");
+    a.clipboard.copy_image();
+    settle().await;
+    assert!(
+        b.clipboard.writes().is_empty(),
+        "{:?}",
+        b.clipboard.writes()
+    );
+    // Sharing still works afterwards.
+    a.clipboard.copy_text("short");
+    wait_until("B got the short text", || {
+        b.clipboard.text().as_deref() == Some("short")
+    })
+    .await;
+    a.handle.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_clipboard_sharing_unless_both_sides_enable_it() {
+    let (a, b) = start_with(with_clipboard(mac_cfg(), 1024), win_cfg()).await;
+    a.clipboard.copy_text("stays on the mac");
+    b.clipboard.copy_text("stays on the pc");
+    settle().await;
+    assert!(a.clipboard.writes().is_empty() && b.clipboard.writes().is_empty());
+    assert_eq!(a.clipboard.text_reads(), 0, "A never read its clipboard");
+    a.handle.shutdown();
+}
+
+/// Regression (Phase 0b): `spawn_session` dropped the capture backend on
+/// return, and real backends stop capturing when dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_capture_backend_lives_exactly_as_long_as_the_session() {
+    let (a, b) = start().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!a.capture.backend_dropped() && !b.capture.backend_dropped());
+    a.handle.shutdown();
+    let end = tokio::time::timeout(T, a.handle.join()).await.unwrap();
+    assert_eq!(end, SessionEnd::Shutdown);
+    wait_until("A's backend released", || a.capture.backend_dropped()).await;
+    let b_end = tokio::time::timeout(T, b.handle.join()).await.unwrap();
+    assert_eq!(b_end, SessionEnd::PeerClosed);
+    wait_until("B's backend released", || b.capture.backend_dropped()).await;
 }

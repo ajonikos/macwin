@@ -1,6 +1,6 @@
 //! macOS backend for macwin: CGEventTap capture, CGEventPost injection,
-//! display enumeration and NSPasteboard. Compiles to an empty library on
-//! other operating systems.
+//! display enumeration, NSPasteboard and the login keychain. Compiles to an
+//! empty library on other operating systems.
 //!
 //! Permissions (System Settings > Privacy & Security): capture needs
 //! Accessibility (active event tap) and may need Input Monitoring;
@@ -13,11 +13,15 @@ mod capture;
 mod clipboard;
 mod convert;
 mod cursor;
+mod host;
 mod inject;
+mod keychain;
 pub mod permissions;
 mod screens;
 
 pub use capture::MacCapture;
 pub use clipboard::MacClipboard;
+pub use host::device_name;
 pub use inject::MacInjector;
+pub use keychain::KeychainStore;
 pub use screens::MacScreens;

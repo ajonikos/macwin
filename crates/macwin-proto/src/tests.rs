@@ -1,8 +1,9 @@
 //! Codec unit tests: every validation rule, version checks and property tests.
 
 use macwin_core::msg::{
-    ButtonMsg, ControlMsg, DatagramMsg, Enter, Heartbeat, Hello, InputMsg, KeyMsg, Leave, MouseAbs,
-    Ping, Pong, TakeControl, WheelMsg,
+    ButtonMsg, ClipboardMsg, ClipboardText, ControlMsg, DatagramMsg, Enter, Heartbeat, Hello,
+    InputMsg, KeyMsg, Leave, MouseAbs, PairConfirm, PairHello, PairMsg, Ping, Pong, TakeControl,
+    WheelMsg,
 };
 use macwin_core::types::{
     Hid, ModifierMask, MouseButton, Os, Point, Rect, RoleKind, ScreenInfo, Side, WheelUnit,
@@ -318,6 +319,119 @@ fn version_checks() {
     assert_eq!(version_major(0x0003_0009), 3);
 }
 
+#[test]
+fn clipboard_text_round_trips_beyond_the_stream_frame_limit() {
+    let text = "текст ".repeat(20_000); // ~220 KB, more than MAX_FRAME_LEN
+    let m = ClipboardMsg::Text(ClipboardText {
+        clock: 42,
+        text: text.clone(),
+    });
+    let bytes = encode_clipboard(&m);
+    assert!(bytes.len() > MAX_FRAME_LEN);
+    assert_eq!(decode_clipboard(&bytes).unwrap(), m);
+    // Debug never shows the content.
+    let dbg = format!("{m:?}");
+    assert!(!dbg.contains("текст") && dbg.contains(&text.len().to_string()));
+}
+
+#[test]
+fn clipboard_limits_and_kinds_are_enforced() {
+    assert!(matches!(
+        decode_clipboard(&wire::ClipboardFrame { kind: None }.encode_to_vec()),
+        Err(ProtoError::UnknownKind("clipboard frame"))
+    ));
+    let too_long = vec![0u8; MAX_CLIPBOARD_FRAME + 1];
+    assert_invalid_value(decode_clipboard(&too_long), "clipboard frame");
+    // Invalid UTF-8 in the text field is a protobuf decode error.
+    let mut bad = wire::ClipboardFrame {
+        kind: Some(wire::clipboard_frame::Kind::Text(wire::ClipboardText {
+            clock: 1,
+            text: "ab".into(),
+        })),
+    }
+    .encode_to_vec();
+    let last = bad.len() - 1;
+    bad[last] = 0xFF;
+    assert!(matches!(decode_clipboard(&bad), Err(ProtoError::Decode(_))));
+}
+
+fn valid_pair_hello() -> wire::PairHello {
+    wire::PairHello {
+        protocol_version: PROTOCOL_VERSION,
+        os: wire::Os::Windows as i32,
+        device_name: "pc".into(),
+        agent_version: "0.1.0".into(),
+        peer_side: wire::Side::Left as i32,
+        spake: vec![0x41; SPAKE_MSG_LEN],
+    }
+}
+
+fn decode_pair_kind(k: wire::pair_frame::Kind) -> Result<PairMsg, ProtoError> {
+    decode_pair(&wire::PairFrame { kind: Some(k) }.encode_to_vec())
+}
+
+#[test]
+fn pair_messages_round_trip() {
+    let hello = PairMsg::Hello(PairHello {
+        protocol_version: PROTOCOL_VERSION,
+        os: Os::MacOs,
+        device_name: "Dmitriy's MacBook Pro".into(),
+        agent_version: "0.1.0".into(),
+        peer_side: None,
+        spake: vec![7; SPAKE_MSG_LEN],
+    });
+    let confirm = PairMsg::Confirm(PairConfirm { mac: [9; 32] });
+    for m in [hello, confirm, PairMsg::Done] {
+        assert_eq!(decode_pair(&encode_pair(&m)).unwrap(), m);
+    }
+}
+
+#[test]
+fn pair_messages_are_validated() {
+    assert!(matches!(
+        decode_pair(&wire::PairFrame { kind: None }.encode_to_vec()),
+        Err(ProtoError::UnknownKind("pair frame"))
+    ));
+    let mut h = valid_pair_hello();
+    h.spake.pop();
+    assert_invalid_value(
+        decode_pair_kind(wire::pair_frame::Kind::Hello(h)),
+        "pair_hello.spake",
+    );
+    let mut h = valid_pair_hello();
+    h.os = 0;
+    assert_invalid_enum(
+        decode_pair_kind(wire::pair_frame::Kind::Hello(h)),
+        "pair_hello.os",
+    );
+    let mut h = valid_pair_hello();
+    h.peer_side = 9;
+    assert_invalid_enum(
+        decode_pair_kind(wire::pair_frame::Kind::Hello(h)),
+        "pair_hello.peer_side",
+    );
+    let mut h = valid_pair_hello();
+    h.device_name = "x".repeat(257);
+    assert_invalid_value(
+        decode_pair_kind(wire::pair_frame::Kind::Hello(h)),
+        "pair_hello.device_name",
+    );
+    let PairMsg::Hello(ok) =
+        decode_pair_kind(wire::pair_frame::Kind::Hello(valid_pair_hello())).unwrap()
+    else {
+        panic!("not a hello")
+    };
+    assert_eq!((ok.os, ok.peer_side), (Os::Windows, Some(Side::Left)));
+    for len in [0, 31, 33] {
+        assert_invalid_value(
+            decode_pair_kind(wire::pair_frame::Kind::Confirm(wire::PairConfirm {
+                mac: vec![1; len],
+            })),
+            "pair_confirm.mac",
+        );
+    }
+}
+
 // ---- property tests ----
 
 fn arb_string() -> impl Strategy<Value = String> {
@@ -486,9 +600,21 @@ proptest! {
     }
 
     #[test]
+    fn prop_clipboard_round_trip(clock in any::<u64>(), text in arb_string(), other in any::<bool>()) {
+        let m = if other {
+            ClipboardMsg::Other { clock }
+        } else {
+            ClipboardMsg::Text(ClipboardText { clock, text })
+        };
+        prop_assert_eq!(decode_clipboard(&encode_clipboard(&m)).unwrap(), m);
+    }
+
+    #[test]
     fn prop_arbitrary_bytes_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
         let _ = decode_control(&bytes);
         let _ = decode_input(&bytes);
         let _ = decode_datagram(&bytes);
+        let _ = decode_clipboard(&bytes);
+        let _ = decode_pair(&bytes);
     }
 }

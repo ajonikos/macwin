@@ -1,28 +1,27 @@
 # macwin
 
 A software KVM for one Mac and one Windows PC on the same LAN: either
-machine's keyboard and mouse can drive both screens, with a shared clipboard
-and file copy-paste planned on top.
+machine's keyboard and mouse can drive both screens, and copied text is
+shared between them. File copy-paste is planned on top.
 
-**Status: Phase 0 (spikes).** The core (protocol, controller state machine,
-QUIC with mutual TLS pinning) is tested; real macOS and Windows backends for
-capture, injection, screens and the clipboard exist and are exercised through
-the `probe` and `spike` commands below. The end-to-end `spike kvm` shares one
-machine's mouse and keyboard with the other, both ways. Clipboard sync, pairing
-by code, a UI and installers come in later phases.
+**Status: Phase 1.** Pairing by a one-time code, the identity key in the
+macOS Keychain / Windows DPAPI, a config file and `macwin run` (keyboard,
+mouse and text clipboard sharing with automatic reconnects) are implemented
+and tested with fakes; the real OS backends still need testing on hardware.
+A UI and installers come in later phases.
 
 ## Workspace
 
 | Path | What it is |
 |---|---|
-| `crates/macwin-core` | Pure logic: vocabulary types, edge-mapping geometry, HID keymap, Ctrl/Cmd remap, pressed-key tracking, heartbeat, emergency chord, the controller state machine (`Engine`). No I/O, threads or clocks. |
+| `crates/macwin-core` | Pure logic: vocabulary types, edge-mapping geometry, HID keymap, Ctrl/Cmd remap, pressed-key tracking, heartbeat, emergency chord, the controller state machine (`Engine`), clipboard sync ordering. No I/O, threads or clocks. |
 | `crates/macwin-proto` | Strict protobuf codec (hand-written `prost` derives, no `protoc`), stream framing, version check. |
-| `crates/macwin-net` | QUIC (quinn + rustls/ring) with mutual TLS and SHA-256 certificate pinning; identity storage; the `Link` abstraction. |
-| `crates/macwin-platform` | Backend traits (capture, injection, screens) and in-memory fakes (`testing` feature). |
-| `crates/macwin-platform-macos` | macOS backend: CGEventTap capture, CGEventPost injection, displays, NSPasteboard (empty on other OSes). |
-| `crates/macwin-platform-windows` | Windows backend: low-level hooks, SendInput, per-monitor-v2 DPI, Win32 clipboard (empty on other OSes). |
+| `crates/macwin-net` | QUIC (quinn + rustls/ring) with mutual TLS and SHA-256 certificate pinning; SPAKE2 pairing; identity bundles; the `Link` abstraction. |
+| `crates/macwin-platform` | Backend traits (capture, injection, screens, clipboard, secret store) and in-memory fakes (`testing` feature). |
+| `crates/macwin-platform-macos` | macOS backend: CGEventTap capture, CGEventPost injection, displays, NSPasteboard, login keychain (empty on other OSes). |
+| `crates/macwin-platform-windows` | Windows backend: low-level hooks, SendInput, per-monitor-v2 DPI, Win32 clipboard, DPAPI (empty on other OSes). |
+| `crates/macwin-agent` | Session driver, reconnecting runner, config (library) and the `macwin` binary. |
 | `scripts/macos` | Builds and signs `target/MacWin.app`, runs it through LaunchServices, stops it. |
-| `crates/macwin-agent` | Session driver (library) and the `macwin` binary. |
 | `tools/keymap-gen` | Generates the HID <-> macOS keycode <-> Windows scancode table from Chromium data. |
 
 ## Building
@@ -49,73 +48,93 @@ Windows CI builds natively with MSVC.
 
 ## Usage
 
+On a Mac, run every command through the signed app bundle
+(`scripts/macos/run.sh <command>`, see below) so that macOS grants its
+permissions and keychain access to MacWin.app.
+
+### 1. Pair the machines (once)
+
+On one machine (here the PC, whose screens are to the right of the Mac):
+
+```sh
+macwin.exe pair --side left
+# listening on 0.0.0.0:47800
+# pairing code: 123-456
+# on the other machine run:
+#   macwin pair 192.168.1.20:47800 --code 123456
+```
+
+On the other machine, run the printed command:
+
+```sh
+scripts/macos/run.sh pair 192.168.1.20:47800 --code 123456
+# paired with "DESKTOP-1" (windows), fingerprint ...
+# its screens are on the right of this machine
+```
+
+`--side` on either machine is enough; the other side is derived. Each code
+works for one attempt: after a wrong code the waiting machine shows a new
+one (at most 5 attempts, 10 minutes). The machine that dialed remembers the
+address and dials it from then on; the other one listens.
+
+### 2. Share
+
+```sh
+macwin.exe run                    # on the PC
+scripts/macos/run.sh run          # on the Mac
+```
+
+Push the cursor over the shared edge to control the other machine; touch the
+other machine's own mouse or keyboard to take control back. Copied text
+appears on the other machine's clipboard. `run` reconnects by itself when the
+network drops or the other machine restarts; Ctrl+C stops it, and so does the
+emergency chord **Ctrl+Alt+Shift+Esc** (Control+Option+Shift+Esc on a Mac).
+
+### Configuration
+
+`config.toml` lives in the config directory
+(`~/Library/Application Support/macwin`, Windows `%APPDATA%\macwin`,
+or `MACWIN_CONFIG_DIR`):
+
+```sh
+macwin config show
+macwin config set side right               # where the peer's screens are
+macwin config set address pc.local:47800   # dial this; `none` = listen
+macwin config set listen 0.0.0.0:47800
+macwin config set remap off                # keep Ctrl and Cmd/Win as they are
+macwin config set clipboard off            # stop sharing the clipboard
+macwin config set clipboard-max-kb 4096    # largest shared text
+macwin unpair                              # forget the peer
+```
+
+### Identity
+
 Every machine has a self-signed identity, created on first use:
 
 ```sh
 macwin identity
 # fingerprint: 3f1c...e9 (64 hex digits)
-# config dir: ~/Library/Application Support/macwin   (Windows: %APPDATA%\macwin)
+# key: login keychain, item "io.macwin.MacWin" / "identity"
+# config dir: ~/Library/Application Support/macwin
 ```
 
-Set `MACWIN_CONFIG_DIR` to use another directory.
+The certificate and key are kept in the login keychain on macOS and in a
+DPAPI-encrypted `identity.dpapi` on Windows. `MACWIN_KEY_STORE=file` keeps
+them in an unencrypted `identity.secret` (mode 0600) instead, for headless
+machines and tests. Phase 0 identity files are moved into the store
+automatically.
 
-### Latency spike
-
-Exchange fingerprints first. Then run the listener on one machine and the
-dialer on the other:
-
-```sh
-# on the PC (listener):
-macwin spike net --listen 0.0.0.0:47800 --peer-fp <Mac fingerprint>
-# on the Mac (dialer):
-macwin spike net --connect <PC address>:47800 --peer-fp <PC fingerprint>
-```
-
-The dialer prints round-trip latency for the reliable input stream and for
-datagrams:
-
-```
-stream   n=1000 lost=0 p50=...ms p95=...ms p99=...ms max=...ms
-datagram n=1000 lost=0 p50=...ms p95=...ms p99=...ms max=...ms
-```
-
-Listening on a LAN address triggers the OS firewall prompt (Windows: allow on
-private networks) and, on macOS 15+, the Local Network permission prompt.
-
-### Probes (read-only)
+### Diagnostics and spikes
 
 ```sh
 macwin probe screens                 # monitors in native coordinates
 macwin probe permissions [--prompt]  # macOS: Accessibility, Input Monitoring, Secure Input
 macwin probe clipboard [--watch]     # format names and sizes, never the content
-```
-
-### Local input spikes
-
-```sh
-macwin spike capture [--seconds 10]  # print local input events, nothing swallowed
-macwin spike capture --grab          # also swallow input and hide the cursor (ends after
-                                     # --seconds or with the emergency chord)
+macwin spike capture [--grab]        # print (and with --grab, swallow) local input
 macwin spike inject --demo           # cursor draws a square, then "hello" is typed
+macwin spike net --listen 0.0.0.0:47800 --peer-fp <hex>    # latency, with manual pins
+macwin spike kvm --connect <host>:47800 --peer-fp <hex> --peer-side right
 ```
-
-### KVM spike
-
-On both machines, with each other's fingerprints (here the PC is to the right
-of the Mac):
-
-```sh
-# PC
-macwin.exe spike kvm --listen 0.0.0.0:47800 --peer-fp <Mac fingerprint> --peer-side left
-# Mac (inside MacWin.app, see below)
-scripts/macos/run.sh spike kvm --connect <PC address>:47800 --peer-fp <PC fingerprint> --peer-side right
-```
-
-Push the cursor over the shared edge to control the other machine; touch the
-other machine's own mouse or keyboard to take control back. `--no-remap`
-disables the Cmd <-> Ctrl swap. Ctrl+C in the terminal stops the session
-(while that machine's keyboard is not being forwarded to the peer); the
-emergency chord **Ctrl+Alt+Shift+Esc** always works.
 
 ### macOS app bundle
 
@@ -125,14 +144,16 @@ from a signed bundle:
 ```sh
 scripts/macos/bundle.sh                       # builds and signs target/MacWin.app
 scripts/macos/run.sh probe permissions --prompt
-scripts/macos/run.sh spike kvm ...            # output in ~/Library/Logs/macwin/macwin.log
+scripts/macos/run.sh run                      # output in ~/Library/Logs/macwin/macwin.log
 scripts/macos/stop.sh
 ```
 
 Grant **Accessibility** and **Input Monitoring** to MacWin in
 System Settings > Privacy & Security, and allow **Local Network** when asked.
-`bundle.sh` signs with `MACWIN_SIGN_IDENTITY` or the first "Apple Development"
-identity, so the permissions survive rebuilds.
+On macOS versions that ask before apps read the clipboard, allow MacWin
+under **Paste from Other Apps**. `bundle.sh` signs with
+`MACWIN_SIGN_IDENTITY` or the first "Apple Development" identity, so the
+permissions and keychain access survive rebuilds.
 
 Known limits: windows of elevated (admin) Windows apps, the Windows lock
 screen and UAC prompts do not accept remote input yet; macOS Secure Input
@@ -140,13 +161,20 @@ screen and UAC prompts do not accept remote input yet; macOS Secure Input
 
 ## Security model
 
-- There is no unencrypted or unauthenticated mode. Every connection is
-  TLS 1.3 over QUIC with client certificates.
-- Each side accepts exactly one peer, identified by the SHA-256 fingerprint
-  of its certificate (`--peer-fp`). A wrong or missing pin fails the
-  handshake on both sides.
-- Phase 0 stores the identity as PEM files (0600, inside a 0700 directory on
-  Unix). Phase 1 moves it to Keychain / DPAPI and adds pairing by a short code.
+- There is no unencrypted or unauthenticated session. Every connection is
+  TLS 1.3 over QUIC with client certificates, and each side accepts exactly
+  one peer, identified by the SHA-256 fingerprint of its certificate.
+- Pairing (separate ALPN `macwin-pair/1`) runs SPAKE2 with the one-time code
+  over a TLS connection that accepts any certificate. Both certificates'
+  fingerprints and a TLS exporter value are bound into the SPAKE2 identities
+  and the key confirmation, so a man in the middle needs the code, and each
+  attempt tests at most one guess.
+- The identity key lives in the Keychain / DPAPI (see above).
+- Clipboard: only plain text is shared, only while both machines enable it.
+  Content marked private by password managers (`org.nspasteboard.Concealed`
+  / `Transient`, Windows `ExcludeClipboardContentFromMonitorProcessing`,
+  `CanUploadToCloudClipboard = 0`) is never sent, and clipboard content is
+  never logged.
 - Emergency chord: **Ctrl+Alt+Shift+Esc** (Control+Option+Shift+Esc on a Mac).
   Capture backends check it on physical keys before anything is swallowed, and
   it always returns local control.

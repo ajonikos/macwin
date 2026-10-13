@@ -280,12 +280,11 @@ async fn memory_pair_round_trip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn persisted_identities_reconnect_with_the_same_pins() {
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
-    let (a, _) = Identity::load_or_create(dir_a.path()).unwrap();
-    let (b, _) = Identity::load_or_create(dir_b.path()).unwrap();
-    let (a2, created) = Identity::load_or_create(dir_a.path()).unwrap();
-    assert!(!created);
+    let (a, bundle_a) = Identity::generate_bundle().unwrap();
+    let b = Identity::generate().unwrap();
+    // What a secret store hands back after a restart.
+    let a2 = Identity::from_pem_bundle(bundle_a.as_bytes()).unwrap();
+    assert_eq!(a2.fingerprint(), a.fingerprint());
     let p = pair(
         &a2,
         &b,
@@ -296,4 +295,176 @@ async fn persisted_identities_reconnect_with_the_same_pins() {
     )
     .await;
     assert!(p.dialer.is_ok() && p.listener.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clipboard_updates_cross_on_their_own_streams() {
+    use macwin_core::msg::{ClipboardMsg, ClipboardText};
+    let (a, mut b) = good_pair().await;
+    // 1 MB: far beyond the 64 KiB stream frame limit.
+    let big = "z".repeat(1 << 20);
+    let msgs = [
+        ClipboardMsg::Text(ClipboardText {
+            clock: 1,
+            text: big,
+        }),
+        ClipboardMsg::Other { clock: 2 },
+    ];
+    for m in &msgs {
+        a.link.tx.send_clipboard(m.clone()).unwrap();
+    }
+    // Heartbeat-like control traffic is not stuck behind the big text.
+    a.link
+        .tx
+        .send_control(ControlMsg::Ping(Ping {
+            id: 1,
+            sent_micros: 1,
+        }))
+        .unwrap();
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        match next(&mut b.link).await {
+            Inbound::Clipboard(m) => got.push(m),
+            Inbound::Control(_) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // Separate streams may arrive in any order.
+    got.sort_by_key(|m| match m {
+        ClipboardMsg::Text(t) => t.clock,
+        ClipboardMsg::Other { clock } => *clock,
+    });
+    assert_eq!(got, msgs);
+    // Oversized updates are refused locally.
+    let huge = ClipboardMsg::Text(ClipboardText {
+        clock: 3,
+        text: "x".repeat(macwin_proto::MAX_CLIPBOARD_TEXT + 1),
+    });
+    assert_eq!(
+        a.link.tx.send_clipboard(huge),
+        Err(macwin_net::LinkError::TooLarge)
+    );
+    a.link.tx.close(codes::NORMAL);
+    loop {
+        if let Inbound::Closed(c) = next(&mut b.link).await {
+            assert_eq!(c, LinkClosed::PeerClosed { code: 0 });
+            break;
+        }
+    }
+}
+
+mod pairing {
+    use macwin_core::types::{Os, Side};
+    use macwin_net::pairing::{PairInfo, PairedPeer, PairingCode, pair_connect, pair_listen};
+    use macwin_net::{Identity, NetError};
+
+    use super::{T, localhost};
+
+    fn info(name: &str, os: Os, side: Option<Side>) -> PairInfo {
+        PairInfo {
+            os,
+            device_name: name.into(),
+            peer_side: side,
+        }
+    }
+
+    /// One listener attempt with `listener_code`, one dial with `dial_code`.
+    async fn attempt(
+        dialer: &Identity,
+        listener: &Identity,
+        dial_code: &str,
+        listener_code: &str,
+    ) -> (Result<PairedPeer, NetError>, Result<PairedPeer, NetError>) {
+        let l = pair_listen(localhost(), listener).await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let code = PairingCode::parse(listener_code).unwrap();
+        let server = tokio::spawn(async move {
+            let r = l
+                .accept(&code, &info("pc", Os::Windows, Some(Side::Left)))
+                .await;
+            l.shutdown().await;
+            r
+        });
+        let d = tokio::time::timeout(
+            T,
+            pair_connect(
+                localhost(),
+                addr,
+                dialer,
+                &PairingCode::parse(dial_code).unwrap(),
+                &info("mac", Os::MacOs, None),
+            ),
+        )
+        .await
+        .expect("dial timed out");
+        let l = tokio::time::timeout(T, server)
+            .await
+            .expect("listener timed out")
+            .unwrap();
+        (d, l)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_right_code_exchanges_fingerprints() {
+        let mac = Identity::generate().unwrap();
+        let pc = Identity::generate().unwrap();
+        let (d, l) = attempt(&mac, &pc, "123456", "123-456").await;
+        let d = d.unwrap();
+        let l = l.unwrap();
+        assert_eq!(d.fingerprint, pc.fingerprint());
+        assert_eq!(l.fingerprint, mac.fingerprint());
+        assert_eq!((d.os, d.device_name.as_str()), (Os::Windows, "pc"));
+        assert_eq!((l.os, l.device_name.as_str()), (Os::MacOs, "mac"));
+        assert_eq!(d.peer_side, Some(Side::Left));
+        assert_eq!(l.peer_side, None);
+        assert!(d.remote.ip().is_loopback());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wrong_code_fails_on_both_sides() {
+        let mac = Identity::generate().unwrap();
+        let pc = Identity::generate().unwrap();
+        let (d, l) = attempt(&mac, &pc, "000001", "000002").await;
+        let d = d.unwrap_err();
+        let l = l.unwrap_err();
+        assert!(
+            matches!(&l, NetError::PairingFailed(m) if m.contains("wrong code")),
+            "{l}"
+        );
+        assert!(matches!(&d, NetError::PairingFailed(_)), "{d}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_machine_cannot_pair_with_itself() {
+        let same = Identity::generate().unwrap();
+        let (d, l) = attempt(&same, &same, "123456", "123456").await;
+        assert!(matches!(d, Err(NetError::PairingFailed(_))));
+        assert!(matches!(l, Err(NetError::PairingFailed(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_dialer_cannot_reach_a_pairing_listener() {
+        // Different ALPN: the TLS handshake itself fails, the code stays unused.
+        let mac = Identity::generate().unwrap();
+        let pc = Identity::generate().unwrap();
+        let l = pair_listen(localhost(), &pc).await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let code = PairingCode::parse("111111").unwrap();
+        let server =
+            tokio::spawn(async move { l.accept(&code, &info("pc", Os::Windows, None)).await });
+        let r = macwin_net::connect(
+            localhost(),
+            addr,
+            &mac,
+            pc.fingerprint(),
+            &super::hello("mac", Os::MacOs),
+        )
+        .await;
+        assert!(r.is_err());
+        let l = tokio::time::timeout(T, server).await.unwrap().unwrap();
+        assert!(
+            matches!(&l, Err(e) if !matches!(e, NetError::PairingFailed(_))),
+            "{l:?}"
+        );
+    }
 }

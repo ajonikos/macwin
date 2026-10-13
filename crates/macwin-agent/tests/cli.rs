@@ -8,9 +8,13 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_macwin");
 
+/// Each child gets its own config dir and keeps its key in a file there:
+/// tests never touch the real keychain.
 fn macwin(config: &Path) -> Command {
     let mut c = Command::new(BIN);
-    c.env("MACWIN_CONFIG_DIR", config).env("RUST_LOG", "warn");
+    c.env("MACWIN_CONFIG_DIR", config)
+        .env("MACWIN_KEY_STORE", "file")
+        .env("RUST_LOG", "warn");
     c
 }
 
@@ -84,19 +88,158 @@ fn identity_is_created_once_and_stable() {
     let hex = line.strip_prefix("fingerprint: ").unwrap();
     assert_eq!(hex.len(), 64);
     assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
-    assert!(
-        String::from_utf8_lossy(&first.stdout)
-            .contains(&format!("config dir: {}", dir.path().display()))
-    );
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(stdout.contains(&format!("config dir: {}", dir.path().display())));
+    assert!(stdout.contains("key: unencrypted file"), "{stdout}");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir.path().join("identity.key.pem"))
+        let mode = std::fs::metadata(dir.path().join("identity.secret"))
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
     }
+}
+
+#[test]
+fn phase0_identity_files_are_migrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (id, bundle) = macwin_net::Identity::generate_bundle().unwrap();
+    let split = bundle.find("-----BEGIN PRIVATE KEY").unwrap();
+    std::fs::write(dir.path().join("identity.crt.pem"), &bundle[..split]).unwrap();
+    std::fs::write(dir.path().join("identity.key.pem"), &bundle[split..]).unwrap();
+    let out = macwin(dir.path()).arg("identity").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("moved the identity"));
+    assert_eq!(fingerprint_of(dir.path()), id.fingerprint().to_string());
+    assert!(!dir.path().join("identity.key.pem").exists());
+    assert!(dir.path().join("identity.secret").exists());
+}
+
+#[test]
+fn an_unknown_key_store_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = macwin(dir.path())
+        .env("MACWIN_KEY_STORE", "vault")
+        .arg("identity")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("MACWIN_KEY_STORE"));
+}
+
+/// Reads lines from a child's stdout on a thread.
+fn lines_of(child: &mut Guard) -> mpsc::Receiver<String> {
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn wait_line(rx: &mpsc::Receiver<String>, prefix: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = rx
+            .recv_timeout(left)
+            .unwrap_or_else(|_| panic!("no line starting with {prefix:?}"));
+        if let Some(rest) = line.strip_prefix(prefix) {
+            return rest.trim().to_string();
+        }
+    }
+}
+
+fn config_of(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("config.toml")).unwrap()
+}
+
+#[test]
+fn two_processes_pair_with_a_code() {
+    let mac = tempfile::tempdir().unwrap();
+    let pc = tempfile::tempdir().unwrap();
+    let (fp_mac, fp_pc) = (fingerprint_of(mac.path()), fingerprint_of(pc.path()));
+    let mut waiting = Guard(
+        macwin(pc.path())
+            .args(["pair", "--listen", "127.0.0.1:0", "--side", "left"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let lines = lines_of(&mut waiting);
+    let addr = wait_line(&lines, "listening on ");
+    let code = wait_line(&lines, "pairing code: ");
+    // A wrong code burns the first code; the waiting side shows a new one.
+    let wrong = if code == "000-000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    let bad = macwin(mac.path())
+        .args(["pair", &addr, "--code", wrong])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("pairing"),
+        "{bad:?}"
+    );
+    let code = wait_line(&lines, "pairing code: ");
+    let good = macwin(mac.path())
+        .args(["pair", &addr, "--code", &code])
+        .output()
+        .unwrap();
+    let good_out = String::from_utf8_lossy(&good.stdout);
+    assert!(
+        good.status.success(),
+        "{good_out}\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert!(good_out.contains("paired with"), "{good_out}");
+    assert!(
+        good_out.contains("its screens are on the right"),
+        "derived from the PC's --side left: {good_out}"
+    );
+    let out = wait_with_timeout(waiting, Duration::from_secs(10));
+    assert!(out.status.success(), "{out:?}");
+    // Each side stored the other's fingerprint; only the dialing side has an address.
+    let (mac_cfg, pc_cfg) = (config_of(mac.path()), config_of(pc.path()));
+    assert!(
+        mac_cfg.contains(&fp_pc) && mac_cfg.contains("address = \"127.0.0.1:"),
+        "{mac_cfg}"
+    );
+    assert!(mac_cfg.contains("side = \"right\""), "{mac_cfg}");
+    assert!(
+        pc_cfg.contains(&fp_mac) && !pc_cfg.contains("address"),
+        "{pc_cfg}"
+    );
+    assert!(pc_cfg.contains("side = \"left\""), "{pc_cfg}");
+    // config set / show / unpair.
+    let set = macwin(pc.path())
+        .args(["config", "set", "clipboard", "off"])
+        .output()
+        .unwrap();
+    assert!(set.status.success(), "{set:?}");
+    let show = macwin(pc.path()).args(["config", "show"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&show.stdout).contains("enabled = false"));
+    let unpair = macwin(pc.path()).arg("unpair").output().unwrap();
+    assert!(String::from_utf8_lossy(&unpair.stdout).contains("forgot"));
+    assert!(!config_of(pc.path()).contains("[peer]"));
+}
+
+#[test]
+fn run_without_a_pairing_explains_what_to_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = macwin(dir.path()).arg("run").output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not paired yet"));
 }
 
 /// Starts a listener and returns it with its bound address.

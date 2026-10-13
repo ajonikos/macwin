@@ -12,6 +12,7 @@ mod endpoint;
 pub mod fingerprint;
 pub mod identity;
 pub mod link;
+pub mod pairing;
 mod session;
 pub mod tls;
 
@@ -19,6 +20,7 @@ pub use endpoint::{Listener, connect, listen};
 pub use fingerprint::Fingerprint;
 pub use identity::{Identity, config_dir};
 pub use link::{Inbound, Link, LinkClosed, LinkError, LinkSender};
+pub use pairing::{PairInfo, PairListener, PairedPeer, PairingCode, pair_connect, pair_listen};
 pub use session::{HELLO_TIMEOUT, Session};
 
 #[derive(Debug, thiserror::Error)]
@@ -47,4 +49,10 @@ pub enum NetError {
     QuicConfig(String),
     #[error("the endpoint is closed")]
     EndpointClosed,
+    /// The attempt used up the pairing code (wrong code, an impostor, or
+    /// a connection lost mid-exchange).
+    #[error("pairing failed: {0}")]
+    PairingFailed(String),
+    #[error("invalid pairing code: {0}")]
+    InvalidCode(&'static str),
 }

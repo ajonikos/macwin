@@ -1,10 +1,15 @@
 //! A transport-agnostic message link: what the driver talks to.
 //!
 //! The QUIC implementation runs one writer task per stream, one reader task
-//! per stream, one datagram reader and a supervisor. Every decode error on
-//! any channel closes the connection as a protocol violation. Exactly one
-//! [`Inbound::Closed`] is delivered per link, after every message that
-//! arrived before the close.
+//! per stream, one datagram reader, one acceptor of unidirectional streams
+//! and a supervisor. Every decode error on any channel closes the
+//! connection as a protocol violation. Exactly one [`Inbound::Closed`] is
+//! delivered per link, after every message that arrived before the close.
+//!
+//! Clipboard updates travel on their own unidirectional streams (one per
+//! message, type byte [`STREAM_CLIPBOARD`], lowest priority), so a large
+//! text never delays heartbeats or input. They are best effort: an update
+//! still in flight when the link closes is lost.
 //!
 //! [`Link::memory_pair`] is an in-process implementation for tests.
 
@@ -13,19 +18,28 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bytes::Bytes;
-use macwin_core::msg::{ControlMsg, DatagramMsg, InputMsg};
+use macwin_core::msg::{ClipboardMsg, ControlMsg, DatagramMsg, InputMsg};
 use macwin_proto::frame::{self, FrameBuffer};
 use macwin_proto::{
-    ProtoError, decode_control, decode_datagram, decode_input, encode_control, encode_datagram,
-    encode_input,
+    MAX_CLIPBOARD_FRAME, ProtoError, clipboard_within_limits, decode_clipboard, decode_control,
+    decode_datagram, decode_input, encode_clipboard, encode_control, encode_datagram, encode_input,
 };
-use quinn::{Connection, ConnectionError, Endpoint, RecvStream, SendStream, VarInt};
+use quinn::{
+    Connection, ConnectionError, Endpoint, ReadToEndError, RecvStream, SendStream, VarInt,
+};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, warn};
 
 use crate::codes;
+
+/// First byte of a unidirectional stream carrying one [`ClipboardMsg`].
+pub const STREAM_CLIPBOARD: u8 = 0x10;
+/// Send priority of clipboard streams (control is 0, input 1).
+const CLIPBOARD_PRIORITY: i32 = -1;
+/// Bound on receiving one clipboard stream.
+pub const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Outgoing queue length per stream; overflowing it closes the link.
 pub const QUEUE_CAPACITY: usize = 4096;
@@ -43,6 +57,7 @@ pub enum Inbound {
     Control(ControlMsg),
     Input(InputMsg),
     Datagram(DatagramMsg),
+    Clipboard(ClipboardMsg),
     /// The link is gone; always the last item.
     Closed(LinkClosed),
 }
@@ -68,6 +83,8 @@ pub enum LinkError {
     Closed,
     #[error("send queue overflow; the link was closed")]
     Overflow,
+    #[error("the message exceeds the size limit")]
+    TooLarge,
 }
 
 /// Both halves of a link.
@@ -114,6 +131,19 @@ impl LinkSender {
         match &*self.inner {
             Inner::Quic(q) => q.send_framed(&q.input, &encode_input(&m)),
             Inner::Memory(mem) => mem.send(Inbound::Input(m)),
+        }
+    }
+
+    /// Sends a clipboard update on its own stream (best effort, see the
+    /// module docs). Fails only when the link is closed or the text exceeds
+    /// [`macwin_proto::MAX_CLIPBOARD_TEXT`].
+    pub fn send_clipboard(&self, m: ClipboardMsg) -> Result<(), LinkError> {
+        if !clipboard_within_limits(&m) {
+            return Err(LinkError::TooLarge);
+        }
+        match &*self.inner {
+            Inner::Quic(q) => q.send_clipboard(&m),
+            Inner::Memory(mem) => mem.send(Inbound::Clipboard(m)),
         }
     }
 
@@ -199,6 +229,23 @@ impl QuicShared {
             }
             Err(TrySendError::Closed(_)) => Err(LinkError::Closed),
         }
+    }
+
+    fn send_clipboard(&self, m: &ClipboardMsg) -> Result<(), LinkError> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(LinkError::Closed);
+        }
+        let body = encode_clipboard(m);
+        if body.len() > MAX_CLIPBOARD_FRAME {
+            return Err(LinkError::TooLarge);
+        }
+        let conn = self.conn.clone();
+        self.runtime.spawn(async move {
+            if let Err(e) = write_clipboard(&conn, &body).await {
+                debug!(error = %e, "clipboard transfer failed");
+            }
+        });
+        Ok(())
     }
 
     fn close(&self, code: u32) {
@@ -360,6 +407,11 @@ pub(crate) fn spawn_quic(endpoint: Endpoint, conn: Connection, streams: Streams)
             inbound_tx.clone(),
             reason.clone(),
         )),
+        runtime.spawn(uni_acceptor(
+            conn.clone(),
+            inbound_tx.clone(),
+            reason.clone(),
+        )),
     ];
     runtime.spawn(supervisor(
         conn.clone(),
@@ -498,6 +550,72 @@ async fn datagram_reader(conn: Connection, tx: mpsc::Sender<Inbound>, reason: Re
                 return;
             }
         }
+    }
+}
+
+async fn write_clipboard(conn: &Connection, body: &[u8]) -> Result<(), String> {
+    let mut send = conn.open_uni().await.map_err(|e| e.to_string())?;
+    let _ = send.set_priority(CLIPBOARD_PRIORITY);
+    send.write_all(&[STREAM_CLIPBOARD])
+        .await
+        .map_err(|e| e.to_string())?;
+    send.write_all(body).await.map_err(|e| e.to_string())?;
+    send.finish().map_err(|e| e.to_string())
+}
+
+/// Accepts the peer's unidirectional streams and reads each in its own
+/// task. Returns once the connection is closed and every reader is done.
+async fn uni_acceptor(conn: Connection, tx: mpsc::Sender<Inbound>, reason: Reason) {
+    let mut readers = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = conn.accept_uni() => match accepted {
+                Ok(recv) => {
+                    readers.spawn(uni_reader(recv, conn.clone(), tx.clone(), reason.clone()));
+                }
+                Err(_) => break,
+            },
+            Some(_) = readers.join_next(), if !readers.is_empty() => {}
+        }
+    }
+    while readers.join_next().await.is_some() {}
+}
+
+async fn uni_reader(
+    mut recv: RecvStream,
+    conn: Connection,
+    tx: mpsc::Sender<Inbound>,
+    reason: Reason,
+) {
+    let read = tokio::time::timeout(
+        CLIPBOARD_READ_TIMEOUT,
+        recv.read_to_end(1 + MAX_CLIPBOARD_FRAME),
+    )
+    .await;
+    let data = match read {
+        Ok(Ok(data)) => data,
+        Ok(Err(ReadToEndError::TooLong)) => {
+            violation(&conn, &reason, "clipboard stream over the limit".into());
+            return;
+        }
+        Ok(Err(e)) => {
+            debug!(error = %e, "unidirectional stream ended early");
+            return;
+        }
+        Err(_) => {
+            debug!("clipboard stream timed out");
+            let _ = recv.stop(VarInt::from_u32(codes::NORMAL));
+            return;
+        }
+    };
+    match data.split_first() {
+        Some((&STREAM_CLIPBOARD, body)) => match decode_clipboard(body) {
+            Ok(m) => {
+                let _ = tx.send(Inbound::Clipboard(m)).await;
+            }
+            Err(e) => violation(&conn, &reason, format!("clipboard frame: {e}")),
+        },
+        _ => violation(&conn, &reason, "unknown unidirectional stream".into()),
     }
 }
 

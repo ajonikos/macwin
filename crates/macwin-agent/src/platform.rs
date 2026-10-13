@@ -1,26 +1,58 @@
 //! The real backends of the host OS (macOS or Windows).
 
-use macwin_platform::PlatformError;
+use std::path::Path;
+
+use macwin_platform::{FileSecretStore, PlatformError, SecretStore};
 
 pub use imp::{capture, clipboard, init, injector, permissions_report, screens};
 
 use crate::driver::Backends;
+use crate::identity_store::KeyStoreKind;
 
-/// All backends a KVM session needs.
-pub fn backends() -> Result<Backends, PlatformError> {
+/// All backends a KVM session needs; the clipboard only when it is shared.
+pub fn backends(with_clipboard: bool) -> Result<Backends, PlatformError> {
     Ok(Backends {
         capture: capture(),
         injector: injector()?,
         screens: screens(),
+        clipboard: with_clipboard.then(clipboard),
     })
+}
+
+/// The secret store of `kind`; file-based stores live in `config_dir`.
+pub fn secret_store(
+    kind: KeyStoreKind,
+    config_dir: &Path,
+) -> Result<Box<dyn SecretStore>, PlatformError> {
+    match kind {
+        KeyStoreKind::File => Ok(Box::new(FileSecretStore::new(config_dir))),
+        KeyStoreKind::Keychain | KeyStoreKind::Dpapi => imp::os_secret_store(kind, config_dir),
+    }
+}
+
+/// A human-readable name of this machine.
+pub fn device_name() -> String {
+    imp::device_name()
+        .or_else(|| {
+            ["COMPUTERNAME", "HOSTNAME"]
+                .iter()
+                .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+        })
+        .unwrap_or_else(|| "unknown".into())
 }
 
 #[cfg(target_os = "macos")]
 mod imp {
+    use std::path::Path;
+
     use macwin_platform::{
-        ClipboardBackend, InputCapture, InputInjector, PlatformError, ScreenSource,
+        ClipboardBackend, InputCapture, InputInjector, PlatformError, ScreenSource, SecretStore,
     };
-    use macwin_platform_macos::{MacCapture, MacClipboard, MacInjector, MacScreens, permissions};
+    use macwin_platform_macos::{
+        KeychainStore, MacCapture, MacClipboard, MacInjector, MacScreens, permissions,
+    };
+
+    use crate::identity_store::KeyStoreKind;
 
     pub fn init() {}
 
@@ -38,6 +70,20 @@ mod imp {
 
     pub fn clipboard() -> Box<dyn ClipboardBackend> {
         Box::new(MacClipboard)
+    }
+
+    pub fn device_name() -> Option<String> {
+        macwin_platform_macos::device_name()
+    }
+
+    pub fn os_secret_store(
+        kind: KeyStoreKind,
+        _config_dir: &Path,
+    ) -> Result<Box<dyn SecretStore>, PlatformError> {
+        match kind {
+            KeyStoreKind::Keychain => Ok(Box::new(KeychainStore::new())),
+            _ => Err(PlatformError::Unsupported),
+        }
     }
 
     /// `prompt` asks macOS to show the permission prompts first.
@@ -71,12 +117,16 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
+    use std::path::Path;
+
     use macwin_platform::{
-        ClipboardBackend, InputCapture, InputInjector, PlatformError, ScreenSource,
+        ClipboardBackend, InputCapture, InputInjector, PlatformError, ScreenSource, SecretStore,
     };
     use macwin_platform_windows::{
-        WinCapture, WinClipboard, WinInjector, WinScreens, init_dpi_awareness,
+        DpapiStore, WinCapture, WinClipboard, WinInjector, WinScreens, init_dpi_awareness,
     };
+
+    use crate::identity_store::KeyStoreKind;
 
     /// Per-monitor-v2 DPI awareness; must run before any backend is used.
     pub fn init() {
@@ -99,6 +149,20 @@ mod imp {
         Box::new(WinClipboard)
     }
 
+    pub fn device_name() -> Option<String> {
+        None
+    }
+
+    pub fn os_secret_store(
+        kind: KeyStoreKind,
+        config_dir: &Path,
+    ) -> Result<Box<dyn SecretStore>, PlatformError> {
+        match kind {
+            KeyStoreKind::Dpapi => Ok(Box::new(DpapiStore::new(config_dir))),
+            _ => Err(PlatformError::Unsupported),
+        }
+    }
+
     pub fn permissions_report(_prompt: bool) -> String {
         "Windows needs no permission prompts.\n\
          Limits: elevated (admin) windows do not accept input from a non-elevated macwin, and the lock\n\
@@ -109,10 +173,14 @@ mod imp {
 
 #[cfg(not(any(target_os = "macos", windows)))]
 mod imp {
+    use std::path::Path;
+
     use macwin_platform::{
-        ClipboardBackend, InputCapture, InputInjector, PlatformError, ScreenSource,
+        ClipboardBackend, InputCapture, InputInjector, PlatformError, ScreenSource, SecretStore,
         UnsupportedPlatform,
     };
+
+    use crate::identity_store::KeyStoreKind;
 
     pub fn init() {}
 
@@ -130,6 +198,17 @@ mod imp {
 
     pub fn clipboard() -> Box<dyn ClipboardBackend> {
         Box::new(UnsupportedPlatform)
+    }
+
+    pub fn device_name() -> Option<String> {
+        None
+    }
+
+    pub fn os_secret_store(
+        _kind: KeyStoreKind,
+        _config_dir: &Path,
+    ) -> Result<Box<dyn SecretStore>, PlatformError> {
+        Err(PlatformError::Unsupported)
     }
 
     pub fn permissions_report(_prompt: bool) -> String {
