@@ -50,6 +50,7 @@ objc2-core-foundation = { version = "=0.3.2", default-features = false, features
     "CFBase",
     "CFDate",
     "CFMachPort",
+    "CFNumber",
     "CFRunLoop",
     "CFString",
 ] }
@@ -65,7 +66,7 @@ objc2-core-graphics = { version = "=0.3.2", default-features = false, features =
     "CGRemoteOperation",
 ] }
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSEvent", "NSPasteboard"] }
-objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSProcessInfo", "NSString"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSProcessInfo", "NSString"] }
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

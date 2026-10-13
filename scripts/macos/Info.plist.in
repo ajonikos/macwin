@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.macwin.MacWin</string>
+	<key>CFBundleName</key>
+	<string>MacWin</string>
+	<key>CFBundleDisplayName</key>
+	<string>MacWin</string>
+	<key>CFBundleExecutable</key>
+	<string>macwin</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>MacWin connects to your other computer on the local network to share the mouse, keyboard and clipboard.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_macwin._udp</string>
+	</array>
+</dict>
+</plist>

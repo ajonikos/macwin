@@ -338,6 +338,26 @@ async fn silent_peer_hits_the_heartbeat_timeout() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn emergency_chord_stops_the_session_and_releases_the_peer() {
+    let (a, b) = start().await;
+    a_controls_b(&a, &b).await;
+    assert!(!a.capture.emit(key(KEY_A, true)));
+    wait_until("B holds KeyA", || {
+        b.injector.pressed_keys().contains(&KEY_A)
+    })
+    .await;
+    // The backend already released the grab locally when it reports this.
+    a.capture
+        .emit_fault(macwin_core::types::CaptureFault::EmergencyChord);
+    let a_end = tokio::time::timeout(T, a.handle.join()).await.unwrap();
+    assert_eq!(a_end, SessionEnd::EmergencyStop);
+    assert!(a.capture.stopped());
+    wait_until("B released", || b.injector.pressed_keys().is_empty()).await;
+    let b_end = tokio::time::timeout(T, b.handle.join()).await.unwrap();
+    assert_eq!(b_end, SessionEnd::PeerClosed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn shutdown_while_controlling_releases_the_peer() {
     let (a, b) = start().await;
     a_controls_b(&a, &b).await;

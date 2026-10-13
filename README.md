@@ -4,11 +4,12 @@ A software KVM for one Mac and one Windows PC on the same LAN: either
 machine's keyboard and mouse can drive both screens, with a shared clipboard
 and file copy-paste planned on top.
 
-**Status: Phase 0a (foundation).** The OS-independent parts exist and are
-tested: protocol, the controller state machine, QUIC networking with mutual
-TLS pinning, and a latency tool. Real input capture, injection and clipboard
-backends arrive in Phase 0b, so nothing here touches your keyboard, mouse or
-clipboard yet.
+**Status: Phase 0 (spikes).** The core (protocol, controller state machine,
+QUIC with mutual TLS pinning) is tested; real macOS and Windows backends for
+capture, injection, screens and the clipboard exist and are exercised through
+the `probe` and `spike` commands below. The end-to-end `spike kvm` shares one
+machine's mouse and keyboard with the other, both ways. Clipboard sync, pairing
+by code, a UI and installers come in later phases.
 
 ## Workspace
 
@@ -18,8 +19,9 @@ clipboard yet.
 | `crates/macwin-proto` | Strict protobuf codec (hand-written `prost` derives, no `protoc`), stream framing, version check. |
 | `crates/macwin-net` | QUIC (quinn + rustls/ring) with mutual TLS and SHA-256 certificate pinning; identity storage; the `Link` abstraction. |
 | `crates/macwin-platform` | Backend traits (capture, injection, screens) and in-memory fakes (`testing` feature). |
-| `crates/macwin-platform-macos` | macOS backend (Phase 0b; empty on other OSes). |
-| `crates/macwin-platform-windows` | Windows backend (Phase 0b; empty on other OSes). |
+| `crates/macwin-platform-macos` | macOS backend: CGEventTap capture, CGEventPost injection, displays, NSPasteboard (empty on other OSes). |
+| `crates/macwin-platform-windows` | Windows backend: low-level hooks, SendInput, per-monitor-v2 DPI, Win32 clipboard (empty on other OSes). |
+| `scripts/macos` | Builds and signs `target/MacWin.app`, runs it through LaunchServices, stops it. |
 | `crates/macwin-agent` | Session driver (library) and the `macwin` binary. |
 | `tools/keymap-gen` | Generates the HID <-> macOS keycode <-> Windows scancode table from Chromium data. |
 
@@ -79,6 +81,62 @@ datagram n=1000 lost=0 p50=...ms p95=...ms p99=...ms max=...ms
 
 Listening on a LAN address triggers the OS firewall prompt (Windows: allow on
 private networks) and, on macOS 15+, the Local Network permission prompt.
+
+### Probes (read-only)
+
+```sh
+macwin probe screens                 # monitors in native coordinates
+macwin probe permissions [--prompt]  # macOS: Accessibility, Input Monitoring, Secure Input
+macwin probe clipboard [--watch]     # format names and sizes, never the content
+```
+
+### Local input spikes
+
+```sh
+macwin spike capture [--seconds 10]  # print local input events, nothing swallowed
+macwin spike capture --grab          # also swallow input and hide the cursor (ends after
+                                     # --seconds or with the emergency chord)
+macwin spike inject --demo           # cursor draws a square, then "hello" is typed
+```
+
+### KVM spike
+
+On both machines, with each other's fingerprints (here the PC is to the right
+of the Mac):
+
+```sh
+# PC
+macwin.exe spike kvm --listen 0.0.0.0:47800 --peer-fp <Mac fingerprint> --peer-side left
+# Mac (inside MacWin.app, see below)
+scripts/macos/run.sh spike kvm --connect <PC address>:47800 --peer-fp <PC fingerprint> --peer-side right
+```
+
+Push the cursor over the shared edge to control the other machine; touch the
+other machine's own mouse or keyboard to take control back. `--no-remap`
+disables the Cmd <-> Ctrl swap. Ctrl+C in the terminal stops the session
+(while that machine's keyboard is not being forwarded to the peer); the
+emergency chord **Ctrl+Alt+Shift+Esc** always works.
+
+### macOS app bundle
+
+macOS grants input permissions per app and per code signature, so run macwin
+from a signed bundle:
+
+```sh
+scripts/macos/bundle.sh                       # builds and signs target/MacWin.app
+scripts/macos/run.sh probe permissions --prompt
+scripts/macos/run.sh spike kvm ...            # output in ~/Library/Logs/macwin/macwin.log
+scripts/macos/stop.sh
+```
+
+Grant **Accessibility** and **Input Monitoring** to MacWin in
+System Settings > Privacy & Security, and allow **Local Network** when asked.
+`bundle.sh` signs with `MACWIN_SIGN_IDENTITY` or the first "Apple Development"
+identity, so the permissions survive rebuilds.
+
+Known limits: windows of elevated (admin) Windows apps, the Windows lock
+screen and UAC prompts do not accept remote input yet; macOS Secure Input
+(password fields) hides keystrokes from macwin while active.
 
 ## Security model
 

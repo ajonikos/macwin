@@ -3,8 +3,10 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod commands;
 pub mod driver;
 pub mod logging;
+pub mod platform;
 pub mod spike_net;
 
 use macwin_core::types::Os;

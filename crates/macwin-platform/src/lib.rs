@@ -70,6 +70,40 @@ pub trait ScreenSource: Send {
     fn screens(&self) -> Result<Vec<ScreenInfo>, PlatformError>;
 }
 
+/// Name of the private clipboard format that marks text written by macwin,
+/// so a clipboard watcher can ignore its own writes.
+pub const CLIPBOARD_ORIGIN_FORMAT: &str = "io.macwin.origin";
+
+/// One format currently on the clipboard. Never carries content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardFormat {
+    pub name: String,
+    /// Size in bytes when the backend could determine it.
+    pub size: Option<usize>,
+}
+
+/// A content-free description of the clipboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardInfo {
+    pub change_count: u64,
+    pub formats: Vec<ClipboardFormat>,
+    /// The clipboard carries [`CLIPBOARD_ORIGIN_FORMAT`] (macwin wrote it).
+    pub ours: bool,
+}
+
+/// The system clipboard. Content must never be logged.
+pub trait ClipboardBackend: Send {
+    /// A counter that changes whenever the clipboard changes (macOS
+    /// `changeCount`, Windows sequence number). Never reads content.
+    fn change_count(&self) -> Result<u64, PlatformError>;
+    /// Format names and sizes. Sizing reads the data, which on macOS 15.4+
+    /// counts as a programmatic pasteboard read (privacy alert).
+    fn inspect(&self) -> Result<ClipboardInfo, PlatformError>;
+    fn read_text(&self) -> Result<Option<String>, PlatformError>;
+    /// Replaces the clipboard with `text` plus the origin marker.
+    fn write_text(&self, text: &str) -> Result<(), PlatformError>;
+}
+
 /// Backend for hosts without an implementation: every call fails with
 /// [`PlatformError::Unsupported`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -92,6 +126,24 @@ impl InputInjector for UnsupportedPlatform {
 
 impl ScreenSource for UnsupportedPlatform {
     fn screens(&self) -> Result<Vec<ScreenInfo>, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+}
+
+impl ClipboardBackend for UnsupportedPlatform {
+    fn change_count(&self) -> Result<u64, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    fn inspect(&self) -> Result<ClipboardInfo, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    fn read_text(&self) -> Result<Option<String>, PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    fn write_text(&self, _text: &str) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported)
     }
 }
@@ -124,5 +176,9 @@ mod tests {
             Err(PlatformError::Unsupported)
         ));
         assert!(matches!(p.screens(), Err(PlatformError::Unsupported)));
+        assert!(matches!(p.change_count(), Err(PlatformError::Unsupported)));
+        assert!(matches!(p.inspect(), Err(PlatformError::Unsupported)));
+        assert!(matches!(p.read_text(), Err(PlatformError::Unsupported)));
+        assert!(matches!(p.write_text("x"), Err(PlatformError::Unsupported)));
     }
 }

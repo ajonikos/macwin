@@ -85,8 +85,22 @@ pub enum SessionEnd {
     HeartbeatTimeout,
     ProtocolViolation(String),
     Shutdown,
+    /// The emergency chord was pressed: local control is back and the agent
+    /// should exit.
+    EmergencyStop,
     Transport(String),
     Internal(String),
+}
+
+/// Asks a running session to stop; cheap to clone.
+#[derive(Clone)]
+pub struct Stopper(Arc<Notify>);
+
+impl Stopper {
+    /// Graceful stop (Leave to the peer, release, close).
+    pub fn shutdown(&self) {
+        self.0.notify_one();
+    }
 }
 
 /// A running session.
@@ -94,6 +108,7 @@ pub struct SessionHandle {
     /// The current role, updated after every Engine step.
     pub role: watch::Receiver<RoleKind>,
     shutdown: Arc<Notify>,
+    link: LinkSender,
     join: JoinHandle<SessionEnd>,
 }
 
@@ -101,6 +116,16 @@ impl SessionHandle {
     /// Asks for a graceful stop (Leave to the peer, release, close).
     pub fn shutdown(&self) {
         self.shutdown.notify_one();
+    }
+
+    /// A stop handle that outlives [`SessionHandle::join`].
+    pub fn stopper(&self) -> Stopper {
+        Stopper(self.shutdown.clone())
+    }
+
+    /// The session's link, for [`LinkSender::wait_closed`] before exiting.
+    pub fn link(&self) -> LinkSender {
+        self.link.clone()
     }
 
     /// Waits for the session to end.
@@ -224,8 +249,17 @@ impl CaptureSink for Sink {
     fn on_fault(&self, fault: CaptureFault) {
         warn!(?fault, "capture fault");
         let mut core = lock(&self.core);
-        let actions = core.engine.on_capture_fault(Instant::now(), fault);
+        let now = Instant::now();
+        let actions = core.engine.on_capture_fault(now, fault);
         core.dispatch(actions);
+        if fault == CaptureFault::EmergencyChord {
+            // The user wants out: end the session cleanly (the peer releases
+            // whatever we injected there) and let the agent exit. The reason is
+            // recorded first so the Engine's Close(Shutdown) does not replace it.
+            core.set_end(SessionEnd::EmergencyStop);
+            let actions = core.engine.shutdown(now);
+            core.dispatch(actions);
+        }
         if core.end.is_some() {
             self.wake.notify_one();
         }
@@ -299,6 +333,7 @@ pub fn spawn_session(
     Ok(SessionHandle {
         role: role_rx,
         shutdown,
+        link: tx,
         join,
     })
 }
