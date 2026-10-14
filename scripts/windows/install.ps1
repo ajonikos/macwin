@@ -30,6 +30,12 @@ foreach ($exe in $programs) {
     }
 }
 
+function Send-SettingChange {
+    # Removing a variable that does not exist changes nothing, but .NET still broadcasts
+    # WM_SETTINGCHANGE, so Explorer starts new programs with the new PATH.
+    [Environment]::SetEnvironmentVariable('MACWIN_SETTING_CHANGE', $null, 'User')
+}
+
 function Stop-Macwin([string]$Folder) {
     # A running copy keeps its files locked; its peer just sees a disconnect.
     Get-Process -Name 'macwin', 'macwin-tray' -ErrorAction SilentlyContinue |
@@ -49,11 +55,26 @@ foreach ($file in $programs + 'uninstall.ps1', 'README.txt', 'THIRD_PARTY_NOTICE
 Write-Host "Installed in $Destination"
 
 if (-not $NoPath) {
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $parts = @($userPath -split ';' | Where-Object { $_ })
-    if ($parts -notcontains $Destination) {
-        [Environment]::SetEnvironmentVariable('Path', (($parts + $Destination) -join ';'), 'User')
-        Write-Host 'Added to PATH: new terminals know `macwin`.'
+    # The raw value and its type (normally REG_EXPAND_SZ), so entries like
+    # %USERPROFILE%\bin stay as they are; [Environment]::SetEnvironmentVariable
+    # would store them expanded.
+    $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+    try {
+        $raw = [string]$envKey.GetValue('Path', '',
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+        if ($envKey.GetValueNames() -contains 'Path' -and
+            $envKey.GetValueKind('Path') -eq [Microsoft.Win32.RegistryValueKind]::String) {
+            $kind = [Microsoft.Win32.RegistryValueKind]::String
+        }
+        $parts = @($raw -split ';' | Where-Object { $_ })
+        if ($parts -notcontains $Destination) {
+            $envKey.SetValue('Path', (($parts + $Destination) -join ';'), $kind)
+            Send-SettingChange
+            Write-Host 'Added to PATH: new terminals know `macwin`.'
+        }
+    } finally {
+        $envKey.Close()
     }
 }
 
