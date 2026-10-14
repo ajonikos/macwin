@@ -12,7 +12,8 @@ use macwin_net::Fingerprint;
     version,
     about = "Share one keyboard, mouse and clipboard between a Mac and a Windows PC on one LAN",
     after_help = "Getting started: run `macwin pair` on one machine; it shows a code. On the other\n\
-                  machine run `macwin pair --code CODE`. Then run `macwin run` on both."
+                  machine run `macwin pair --code CODE`. Then run `macwin tray` (or `macwin run`)\n\
+                  on both."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -34,6 +35,10 @@ pub enum Command {
     /// Share the keyboard, mouse and clipboard with the paired machine and
     /// reconnect whenever the connection drops (Ctrl+C to stop).
     Run,
+    /// Share from the menu bar (macOS) or the notification area (Windows):
+    /// status, pause, clipboard, pairing, start at login. MacWin.app opened
+    /// without arguments and macwin-tray.exe do the same.
+    Tray,
     /// Start the tray at login (macOS LaunchAgent, Windows Run key).
     Autostart {
         #[arg(value_enum, default_value_t = AutostartArg::Status)]
@@ -368,6 +373,7 @@ mod tests {
             Command::Config(ConfigCmd::Show)
         ));
         assert!(matches!(parse(&["run"]).unwrap().command, Command::Run));
+        assert!(matches!(parse(&["tray"]).unwrap().command, Command::Tray));
         for (args, want) in [
             (&["autostart"][..], AutostartArg::Status),
             (&["autostart", "on"], AutostartArg::On),

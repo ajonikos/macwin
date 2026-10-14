@@ -16,7 +16,7 @@ use macwin_net::discovery::{DISCOVERY_WAIT, responder_addr};
 use macwin_net::pairing::{PairInfo, PairingCode};
 use macwin_net::{Fingerprint, Identity, NetError, Session, config_dir, connect, listen};
 use macwin_platform::{CaptureSink, ClipboardInfo};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::autostart::{self, AutostartState};
 use crate::cli::{AutostartArg, PairArgs, SpikeCaptureArgs, SpikeKvmArgs, SpikeNetArgs};
@@ -31,7 +31,9 @@ use crate::pairing::{
 };
 use crate::runner::{self, Mode, RunDiscovery, RunEvent, RunExit, RunOptions, bind_for, resolve};
 use crate::spike_net::{self, SpikeOpts, spike_hello};
+use crate::tray::{self, DiscoveryTargets, MakeBackends, TrayEnv};
 use crate::{device_name, host_os, platform};
+use crate::{instance, logging};
 
 /// The emergency chord, as shown to users.
 pub const EMERGENCY_CHORD: &str = "Ctrl+Alt+Shift+Esc (Control+Option+Shift+Esc on a Mac)";
@@ -300,9 +302,18 @@ fn print_event(e: RunEvent) {
     let _ = std::io::stdout().flush();
 }
 
+/// The cache directory (the instance lock, received files, the tray log).
+fn cache_dir() -> anyhow::Result<PathBuf> {
+    Ok(macwin_net::cache_dir(|k| std::env::var_os(k))?)
+}
+
+const ALREADY_RUNNING: &str =
+    "macwin is already running on this machine (the tray or `macwin run`); quit it first";
+
 pub async fn run() -> anyhow::Result<()> {
     let os = supported_os()?;
     platform::init();
+    let _lock = instance::acquire(&cache_dir()?)?.context(ALREADY_RUNNING)?;
     let id = load_identity()?;
     let config = Config::load(&id.config_dir)?;
     let peer = config.peer.clone().context(
@@ -378,7 +389,75 @@ pub async fn run() -> anyhow::Result<()> {
 
 /// Where received files wait until they are pasted.
 pub fn staging_dir() -> anyhow::Result<PathBuf> {
-    Ok(macwin_net::cache_dir(|k| std::env::var_os(k))?.join("incoming"))
+    Ok(cache_dir()?.join("incoming"))
+}
+
+// ---------- macwin tray ----------
+
+/// The tray (`macwin tray`, MacWin.app, macwin-tray.exe): the UI runs on
+/// this (main) thread, everything else on a tokio runtime. Logs go to a
+/// file; errors before the UI is up are also shown in an alert.
+pub fn tray() -> anyhow::Result<()> {
+    let log = logging::log_path(|k| std::env::var_os(k));
+    match &log {
+        Some(path) => {
+            if let Err(e) = logging::init_file(path) {
+                logging::init();
+                warn!(error = %e, path = %path.display(), "cannot open the log file");
+            }
+        }
+        None => logging::init(),
+    }
+    let result = run_tray_app();
+    if let Err(e) = &result {
+        error!(error = %format!("{e:#}"), "the tray stopped");
+        platform::alert("macwin", &format!("macwin cannot start: {e:#}"));
+    }
+    result
+}
+
+fn run_tray_app() -> anyhow::Result<()> {
+    let os = supported_os()?;
+    platform::init();
+    let Some(_lock) = instance::acquire(&cache_dir()?)? else {
+        info!("another macwin is running");
+        platform::alert("macwin", ALREADY_RUNNING);
+        return Ok(());
+    };
+    let id = load_identity()?;
+    info!(version = env!("CARGO_PKG_VERSION"), "tray starting");
+    let make_backends: MakeBackends = Arc::new(platform::backends);
+    let discovery_targets: DiscoveryTargets = Arc::new(discovery_targets);
+    let env = TrayEnv {
+        config_dir: id.config_dir,
+        identity: id.identity,
+        os,
+        device_name: device_name(),
+        staging: staging_dir()?,
+        make_backends,
+        autostart: autostart::for_this_machine().ok(),
+        discovery_targets,
+        discovery_wait: DISCOVERY_WAIT,
+        retry_min: runner::RETRY_MIN,
+        retry_max: runner::RETRY_MAX,
+        connect_timeout: runner::CONNECT_TIMEOUT,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("cannot start the runtime")?;
+    let (app, controller) = tray::start(env);
+    let controller = runtime.spawn(controller);
+    let quitter = app.clone();
+    runtime.spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        quitter.quit();
+    });
+    // On macOS this ends the process once the controller has finished.
+    platform::run_tray(app.clone())?;
+    let _ = runtime.block_on(tokio::time::timeout(Duration::from_secs(5), controller));
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    Ok(())
 }
 
 /// The session settings `config` asks for.
