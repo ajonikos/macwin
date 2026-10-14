@@ -5,8 +5,9 @@
 # terminal. Output goes to ~/Library/Logs/macwin/macwin.log and is followed
 # here. Ctrl+C in this terminal stops the app gracefully.
 #
+#   scripts/macos/run.sh                 # the menu bar app (like opening MacWin.app)
 #   scripts/macos/run.sh probe permissions --prompt
-#   scripts/macos/run.sh pair 192.168.1.20:47800 --code 123456
+#   scripts/macos/run.sh pair --code 123456
 #   scripts/macos/run.sh run
 #
 # There is no terminal input inside the app: pass the pairing code with --code.
