@@ -41,4 +41,7 @@ or launch MacWin.app on this Mac, tests on 127.0.0.1, pinned permissive deps, Ru
   part, as the user asked. Report: phase3-report.md.
 - Phase 4: designed in phase4-design.md (feasible as an opt-in SYSTEM service with a session
   agent that follows the input desktop); implementing it needs Windows hardware.
+- Name and logo: proposal in assets/brand (PR #3, draft): app icon, menu bar glyph, Edgeway
+  recommended (Spanway, Crosslane as alternatives). Waiting for the owner's choice; then switch
+  the app's icon and user-visible names (internal identifiers: migrate or keep).
 - Next: hardware test of Phases 1-3 (unverified lists in the reports), then Phase 4 if wanted.
