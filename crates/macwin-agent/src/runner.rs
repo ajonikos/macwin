@@ -7,6 +7,8 @@
 //! a dialing machine whose dial failed asks where the peer is now, so a
 //! changed IP address heals by itself.
 
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -109,6 +111,23 @@ pub fn bind_for(remote: SocketAddr) -> SocketAddr {
         (false, false) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
     SocketAddr::new(ip, 0)
+}
+
+/// Runs `bind` again while its port is still held, for up to 3 s: a QUIC
+/// endpoint that just closed (the previous session, a pairing listener)
+/// releases its socket only once its connections have drained.
+pub async fn retry_in_use<T, F: Future<Output = Result<T, NetError>>>(
+    mut bind: impl FnMut() -> F,
+) -> Result<T, NetError> {
+    for _ in 0..30 {
+        match bind().await {
+            Err(NetError::Io(e)) if e.kind() == io::ErrorKind::AddrInUse => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            other => return other,
+        }
+    }
+    bind().await
 }
 
 /// Resolves `HOST:PORT` to its first address.
@@ -221,7 +240,7 @@ pub async fn run(
 ) -> anyhow::Result<RunExit> {
     let listener = match &opts.mode {
         Mode::Listen(addr) => {
-            let l = listen(*addr, &id, opts.peer)
+            let l = retry_in_use(|| listen(*addr, &id, opts.peer))
                 .await
                 .with_context(|| format!("cannot listen on {addr}"))?;
             on_event(RunEvent::Listening(l.local_addr()?));

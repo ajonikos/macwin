@@ -22,6 +22,7 @@ pub mod image;
 mod secrets;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod tray;
 
 pub use secrets::{FileSecretStore, SecretStore, check_secret_name};
 

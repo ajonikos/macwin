@@ -20,6 +20,7 @@ pub mod pairing;
 pub mod runner;
 pub mod sharing;
 pub mod transfer;
+pub mod tray;
 
 /// The OS this binary runs on, if macwin supports it.
 pub fn host_os() -> Option<Os> {
