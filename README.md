@@ -4,12 +4,13 @@ A software KVM for one Mac and one Windows PC on the same LAN: either
 machine's keyboard and mouse can drive both screens, and copied text,
 images and files are shared between them.
 
-**Status: Phase 2.** Pairing by a one-time code, the identity key in the
-macOS Keychain / Windows DPAPI, a config file and `macwin run` (keyboard,
-mouse with smooth trackpad scrolling, clipboard sharing of text, images and
-files, automatic reconnects) are implemented and tested with fakes; the real
-OS backends still need testing on hardware. A UI and installers come in
-later phases.
+**Status: Phase 3.** Pairing by a one-time code (the machines find each
+other on the LAN), the identity key in the macOS Keychain / Windows DPAPI,
+keyboard and mouse sharing with smooth trackpad scrolling, clipboard sharing
+of text, images and files, automatic reconnects, a menu bar / notification
+area app, start at login and installable packages are implemented and tested
+with fakes and in CI; the real OS backends and the tray UI still need
+testing on hardware.
 
 ## Workspace
 
@@ -18,11 +19,12 @@ later phases.
 | `crates/macwin-core` | Pure logic: vocabulary types, edge-mapping geometry, HID keymap, Ctrl/Cmd remap, pressed-key tracking, heartbeat, emergency chord, the controller state machine (`Engine`), clipboard sync ordering. No I/O, threads or clocks. |
 | `crates/macwin-proto` | Strict protobuf codec (hand-written `prost` derives, no `protoc`), stream framing, version check. |
 | `crates/macwin-net` | QUIC (quinn + rustls/ring) with mutual TLS and SHA-256 certificate pinning; SPAKE2 pairing; identity bundles; the `Link` abstraction. |
-| `crates/macwin-platform` | Backend traits (capture, injection, screens, clipboard, secret store) and in-memory fakes (`testing` feature). |
-| `crates/macwin-platform-macos` | macOS backend: CGEventTap capture, CGEventPost injection, displays, NSPasteboard, login keychain (empty on other OSes). |
-| `crates/macwin-platform-windows` | Windows backend: low-level hooks, SendInput, per-monitor-v2 DPI, Win32 clipboard, DPAPI (empty on other OSes). |
-| `crates/macwin-agent` | Session driver, reconnecting runner, config (library) and the `macwin` binary. |
-| `scripts/macos` | Builds and signs `target/MacWin.app`, runs it through LaunchServices, stops it. |
+| `crates/macwin-platform` | Backend traits (capture, injection, screens, clipboard, secret store), the tray view model, and in-memory fakes (`testing` feature). |
+| `crates/macwin-platform-macos` | macOS backend: CGEventTap capture, CGEventPost injection, displays, NSPasteboard, login keychain, menu bar item (empty on other OSes). |
+| `crates/macwin-platform-windows` | Windows backend: low-level hooks, SendInput, per-monitor-v2 DPI, Win32 clipboard, DPAPI, `Run` key, notification area icon (empty on other OSes). |
+| `crates/macwin-agent` | Session driver, reconnecting runner, LAN discovery use, tray controller, config (library) and the `macwin` / `macwin-tray` binaries. |
+| `scripts/macos` | Builds and signs `target/MacWin.app`, packs it into a dmg, runs it through LaunchServices, stops it. |
+| `scripts/windows` | Builds the Windows zip; `install.ps1` / `uninstall.ps1` inside it. |
 | `tools/keymap-gen` | Generates the HID <-> macOS keycode <-> Windows scancode table from Chromium data. |
 
 ## Building
@@ -37,38 +39,71 @@ cargo test --workspace --all-features
 cargo build --release -p macwin-agent          # target/release/macwin
 ```
 
-### Windows binary from a Mac
+### Windows binaries from a Mac
 
 ```sh
 brew install mingw-w64                          # provides x86_64-w64-mingw32-gcc
 cargo build --release -p macwin-agent --target x86_64-pc-windows-gnu
-# -> target/x86_64-pc-windows-gnu/release/macwin.exe
+# -> target/x86_64-pc-windows-gnu/release/macwin.exe and macwin-tray.exe
 ```
 
 Windows CI builds natively with MSVC.
 
+### Packages
+
+```sh
+scripts/macos/dmg.sh          # target/MacWin-<version>.dmg (builds and signs MacWin.app)
+scripts/windows/package.sh    # target/macwin-<version>-windows-x64.zip (cross-built)
+```
+
+CI builds both on every push and keeps them as artifacts of the `package`
+jobs for 14 days. Neither is notarized or code-signed for distribution:
+Gatekeeper and SmartScreen warn on first launch.
+
+## Installing
+
+- **Mac:** open the dmg and drag MacWin to Applications. Open MacWin: it
+  lives in the menu bar (no Dock icon). Grant the permissions described in
+  [macOS permissions](#macos-app-bundle-and-permissions).
+- **Windows:** extract the zip and double-click `install.cmd` (it runs
+  `install.ps1`). It installs for the current user in
+  `%LOCALAPPDATA%\Programs\macwin`, adds that folder to PATH, starts macwin
+  at login, allows UDP 47800-47801 through Windows Firewall on private
+  networks (one administrator prompt; `-AllNetworks` adds Public networks)
+  and starts the notification area icon. `uninstall.ps1` removes it again;
+  `-Purge` also deletes the settings and the identity key.
+
 ## Usage
 
-On a Mac, run every command through the signed app bundle
-(`scripts/macos/run.sh <command>`, see below) so that macOS grants its
-permissions and keychain access to MacWin.app.
+The tray app (MacWin.app in the menu bar, `macwin-tray.exe` in the Windows
+notification area, or `macwin tray`) does everything below from its menu.
+The same works from the command line; on a Mac, run commands through the
+signed app bundle (`scripts/macos/run.sh <command>`, see below) so that macOS
+grants its permissions and keychain access to MacWin.app.
 
 ### 1. Pair the machines (once)
 
-On one machine (here the PC, whose screens are to the right of the Mac):
+In the menu of one machine choose **Pair with another computer…**: it shows
+a code. On the other machine choose **Enter pairing code…** and type it.
+The machines find each other on the local network; then choose where the
+other machine's screens are (**Other computer is on the left / right**).
+
+From the command line (here the PC, whose screens are to the right of the
+Mac, waits):
 
 ```sh
 macwin.exe pair --side left
 # listening on 0.0.0.0:47800
 # pairing code: 123-456
 # on the other machine run:
+#   macwin pair --code 123456
+# or, if it does not find this machine:
 #   macwin pair 192.168.1.20:47800 --code 123456
 ```
 
-On the other machine, run the printed command:
-
 ```sh
-scripts/macos/run.sh pair 192.168.1.20:47800 --code 123456
+scripts/macos/run.sh pair --code 123456
+# found "DESKTOP-1" (windows) at 192.168.1.20:47800
 # paired with "DESKTOP-1" (windows), fingerprint ...
 # its screens are on the right of this machine
 ```
@@ -76,20 +111,29 @@ scripts/macos/run.sh pair 192.168.1.20:47800 --code 123456
 `--side` on either machine is enough; the other side is derived. Each code
 works for one attempt: after a wrong code the waiting machine shows a new
 one (at most 5 attempts, 10 minutes). The machine that dialed remembers the
-address and dials it from then on; the other one listens.
+address and dials it from then on; the other one listens. When that address
+stops answering, the dialing machine asks the LAN where its peer is now and
+keeps the new IP address.
 
 ### 2. Share
 
-```sh
-macwin.exe run                    # on the PC
-scripts/macos/run.sh run          # on the Mac
-```
+Open the tray app on both machines (or run `macwin.exe run` on the PC and
+`scripts/macos/run.sh run` on the Mac).
 
 Push the cursor over the shared edge to control the other machine; touch the
 other machine's own mouse or keyboard to take control back. Trackpad and
-Magic Mouse scrolling stays smooth on the PC. `run` reconnects by itself when
-the network drops or the other machine restarts; Ctrl+C stops it, and so does
-the emergency chord **Ctrl+Alt+Shift+Esc** (Control+Option+Shift+Esc on a Mac).
+Magic Mouse scrolling stays smooth on the PC. Sharing reconnects by itself
+when the network drops or the other machine restarts. The emergency chord
+**Ctrl+Alt+Shift+Esc** (Control+Option+Shift+Esc on a Mac) always returns
+local control: it pauses the tray (**Resume sharing** continues) and stops
+`run`. Only one macwin (tray or `run`) runs per user at a time.
+
+The tray menu shows the state (waiting, connected, controlling, …) and has
+**Pause sharing**, **Share clipboard**, the side of the other machine,
+pairing, **Start at login** and **Quit**. Start at login also works with
+`macwin autostart on|off|status` (a LaunchAgent on macOS, the `Run` key on
+Windows). The tray logs to `~/Library/Logs/macwin/macwin.log` (Mac) or
+`%LOCALAPPDATA%\macwin\macwin.log` (Windows).
 
 What you copy appears on the other machine's clipboard:
 
@@ -121,6 +165,8 @@ macwin config set side right               # where the peer's screens are
 macwin config set address pc.local:47800   # dial this; `none` = listen
 macwin config set listen 0.0.0.0:47800
 macwin config set remap off                # keep Ctrl and Cmd/Win as they are
+macwin config set discovery off            # neither answer nor send LAN discovery
+macwin config set discovery-port 47801     # UDP port of LAN discovery
 macwin config set clipboard off            # stop sharing the clipboard
 macwin config set clipboard-max-kb 4096    # largest shared text
 macwin config set clipboard-images off     # text and files only
@@ -158,13 +204,14 @@ macwin spike net --listen 0.0.0.0:47800 --peer-fp <hex>    # latency, with manua
 macwin spike kvm --connect <host>:47800 --peer-fp <hex> --peer-side right
 ```
 
-### macOS app bundle
+### macOS app bundle and permissions
 
 macOS grants input permissions per app and per code signature, so run macwin
 from a signed bundle:
 
 ```sh
 scripts/macos/bundle.sh                       # builds and signs target/MacWin.app
+scripts/macos/run.sh                          # the menu bar app
 scripts/macos/run.sh probe permissions --prompt
 scripts/macos/run.sh run                      # output in ~/Library/Logs/macwin/macwin.log
 scripts/macos/stop.sh
@@ -179,9 +226,14 @@ permissions and keychain access survive rebuilds.
 
 Known limits: windows of elevated (admin) Windows apps, the Windows lock
 screen and UAC prompts do not accept remote input yet; macOS Secure Input
-(password fields) hides keystrokes from macwin while active. Copied files
-travel when they are copied, not when they are pasted, so a large copy
-takes a moment to become pasteable on the other machine.
+(password fields) hides keystrokes from macwin while active. Copied files travel when they are
+copied, not when they are pasted, so a large copy takes a moment to become
+pasteable on the other machine. LAN discovery uses IPv4 broadcasts: across
+subnets or VPNs, pair with an address and set `address` by hand.
+
+Network: UDP 47800 carries sessions and pairing (QUIC), UDP 47801 LAN
+discovery; the listening machine needs both open (the Windows installer adds
+the firewall rules).
 
 ## Security model
 
@@ -194,6 +246,13 @@ takes a moment to become pasteable on the other machine.
   and the key confirmation, so a man in the middle needs the code, and each
   attempt tests at most one guess.
 - The identity key lives in the Keychain / DPAPI (see above).
+- LAN discovery is a hint, never trusted: a machine that answers still has
+  to pass pairing (the code) or certificate pinning (sessions), so a forged
+  answer costs at most one failed attempt. Queries for the paired peer name
+  it by SHA-256 tags over a random nonce and both fingerprints, so the
+  fingerprints are never broadcast and only the right machine answers; a
+  machine waiting for pairing announces its name, OS and fingerprint to the
+  LAN while it waits. `discovery = false` turns it off.
 - Clipboard: each kind (text, images, files) is shared only while both
   machines enable it. Content marked private by password managers
   (`org.nspasteboard.Concealed` / `Transient`, Windows
