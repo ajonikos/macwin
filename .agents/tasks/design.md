@@ -66,7 +66,7 @@ Rust 1.96.0, edition 2024, Cargo workspace (resolver 3). All versions exact-pinn
 | clap | =4.6.7 | derive | agent |
 | tokio | =1.53.2 | rt-multi-thread, macros, net, time, sync, signal | net, agent |
 | quinn | =0.11.12 | `default-features = false`, runtime-tokio, rustls-ring | net |
-| rustls | =0.23.45 | `default-features = false`, ring, std | net |
+| rustls | =0.23.46 | `default-features = false`, ring, std | net |
 | rcgen | =0.14.10 | `default-features = false`, crypto, ring, pem | net |
 | ring | =0.17.14 | default | net (SHA-256) |
 | libc | =0.2.190 | default | platform-macos (gethostname, thread QoS) |
