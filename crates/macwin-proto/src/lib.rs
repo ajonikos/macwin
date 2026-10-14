@@ -2,15 +2,17 @@
 //! in `macwin_core::msg`, stream framing and version negotiation.
 //!
 //! Three frame families exist, one per channel: control stream, input stream
-//! and datagrams. Decoding validates everything; invalid input is an error,
-//! never a panic.
+//! and datagrams; pairing, clipboard and LAN discovery have their own.
+//! Decoding validates everything; invalid input is an error, never a panic.
 #![forbid(unsafe_code)]
 
 mod convert;
 pub mod frame;
 pub mod wire;
 
-use macwin_core::msg::{ClipboardMsg, ControlMsg, DatagramMsg, FilesHeader, InputMsg, PairMsg};
+use macwin_core::msg::{
+    ClipboardMsg, ControlMsg, DatagramMsg, DiscoveryMsg, FilesHeader, InputMsg, PairMsg,
+};
 use prost::Message;
 
 pub use convert::check_relative_path;
@@ -43,6 +45,10 @@ pub const MAX_FILES_TOTAL: u64 = 64 * 1024 * 1024 * 1024;
 pub const SPAKE_MSG_LEN: usize = 33;
 /// Length of a pairing key-confirmation MAC (HMAC-SHA256).
 pub const PAIR_MAC_LEN: usize = 32;
+/// First bytes of every LAN discovery datagram.
+pub const DISCOVERY_MAGIC: [u8; 4] = *b"MWD1";
+/// Largest LAN discovery datagram, magic included.
+pub const MAX_DISCOVERY_LEN: usize = 512;
 /// Largest accepted string field, in bytes.
 pub const MAX_STRING_LEN: usize = 256;
 /// Most capabilities accepted in a Hello.
@@ -202,6 +208,29 @@ pub fn encode_pair(m: &PairMsg) -> Vec<u8> {
 
 pub fn decode_pair(b: &[u8]) -> Result<PairMsg, ProtoError> {
     convert::pair_from_wire(wire::PairFrame::decode(b)?)
+}
+
+/// A discovery datagram: [`DISCOVERY_MAGIC`] followed by the protobuf body.
+pub fn encode_discovery(m: &DiscoveryMsg) -> Vec<u8> {
+    let mut out = DISCOVERY_MAGIC.to_vec();
+    out.extend_from_slice(&convert::discovery_to_wire(m).encode_to_vec());
+    out
+}
+
+pub fn decode_discovery(b: &[u8]) -> Result<DiscoveryMsg, ProtoError> {
+    if b.len() > MAX_DISCOVERY_LEN {
+        return Err(ProtoError::InvalidValue {
+            field: "discovery datagram",
+            reason: "longer than 512 bytes",
+        });
+    }
+    let body = b
+        .strip_prefix(&DISCOVERY_MAGIC)
+        .ok_or(ProtoError::InvalidValue {
+            field: "discovery datagram",
+            reason: "not a macwin discovery datagram",
+        })?;
+    convert::discovery_from_wire(wire::DiscoveryFrame::decode(body)?)
 }
 
 #[cfg(test)]

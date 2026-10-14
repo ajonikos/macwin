@@ -34,4 +34,11 @@ or launch MacWin.app on this Mac, tests on 127.0.0.1, pinned permissive deps, Ru
   remembers the last image it read or wrote with a hash of its decoded pixels and reports a
   re-encoded copy with the earlier bytes (core keeps comparing bytes). Pixel wheel is gated by
   capability input.wheel-pixel; older peers get Notch120 (40 px = 1 notch).
-- Next: Phase 3.
+- Phase 3 done (PR #2, stacked on PR #1: rustls 0.23.46 for RUSTSEC-2026-0346..0349, which had
+  turned master's cargo-deny red): LAN discovery (pairing by code alone, a moved peer found
+  again), autostart, tray (macOS menu bar, Windows notification area), single instance, dmg and
+  Windows zip with install/uninstall scripts, CI package job with artifacts. One commit per
+  part, as the user asked. Report: phase3-report.md.
+- Phase 4: designed in phase4-design.md (feasible as an opt-in SYSTEM service with a session
+  agent that follows the input desktop); implementing it needs Windows hardware.
+- Next: hardware test of Phases 1-3 (unverified lists in the reports), then Phase 4 if wanted.

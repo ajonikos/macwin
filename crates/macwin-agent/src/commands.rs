@@ -1,8 +1,8 @@
 //! Implementations of the `macwin` subcommands.
 
 use std::io::{BufRead, IsTerminal, Write};
-use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -12,28 +12,31 @@ use macwin_core::keymap;
 use macwin_core::types::{
     CaptureFault, CapturedEvent, GrabCommand, Hid, InjectCommand, Point, ScreenInfo, Side,
 };
-use macwin_net::pairing::{PairInfo, PairListener, PairedPeer, PairingCode};
-use macwin_net::{Identity, NetError, Session, config_dir, connect, listen};
+use macwin_net::discovery::{DISCOVERY_WAIT, responder_addr};
+use macwin_net::pairing::{PairInfo, PairingCode};
+use macwin_net::{Fingerprint, Identity, NetError, Session, config_dir, connect, listen};
 use macwin_platform::{CaptureSink, ClipboardInfo};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-use crate::cli::{PairArgs, SpikeCaptureArgs, SpikeKvmArgs, SpikeNetArgs};
-use crate::config::{Config, PeerConfig, normalize_address, os_name, side_name};
+use crate::autostart::{self, AutostartState};
+use crate::cli::{AutostartArg, PairArgs, SpikeCaptureArgs, SpikeKvmArgs, SpikeNetArgs};
+use crate::config::{Config, normalize_address, os_name, remember_peer_address, side_name};
 use crate::driver::{
     ClipboardSettings, Connected, SessionConfig, SessionEnd, kvm_hello, spawn_session,
 };
 use crate::identity_store::{IDENTITY_SECRET, IdentityOrigin, KeyStoreKind, load_or_create};
-use crate::runner::{self, Mode, RunEvent, RunExit, RunOptions, bind_for, resolve};
+use crate::lan::{discovery_targets, reachable_ip};
+use crate::pairing::{
+    agree_side, find_waiting, pairing_responder, store_pairing, wait_for_pairing,
+};
+use crate::runner::{self, Mode, RunDiscovery, RunEvent, RunExit, RunOptions, bind_for, resolve};
 use crate::spike_net::{self, SpikeOpts, spike_hello};
+use crate::tray::{self, DiscoveryTargets, MakeBackends, TrayEnv};
 use crate::{device_name, host_os, platform};
+use crate::{instance, logging};
 
 /// The emergency chord, as shown to users.
 pub const EMERGENCY_CHORD: &str = "Ctrl+Alt+Shift+Esc (Control+Option+Shift+Esc on a Mac)";
-/// How long `macwin pair` waits for the other machine.
-pub const PAIR_WINDOW: Duration = Duration::from_secs(600);
-/// Failed attempts after which `macwin pair` gives up.
-pub const MAX_PAIR_ATTEMPTS: u32 = 5;
-
 /// This machine's identity and where it came from.
 pub struct LoadedIdentity {
     pub identity: Identity,
@@ -78,66 +81,21 @@ fn supported_os() -> anyhow::Result<macwin_core::types::Os> {
 
 // ---------- pairing and configuration ----------
 
-/// The address the other machine should dial: the bound IP, or for a
-/// wildcard bind the IP of the default route (found without sending
-/// anything: connecting a UDP socket only picks a route).
-fn reachable_ip(local: SocketAddr) -> Option<IpAddr> {
-    if !local.ip().is_unspecified() {
-        return Some(local.ip());
-    }
-    let probe = UdpSocket::bind("0.0.0.0:0").ok()?;
-    probe.connect("192.0.2.1:9").ok()?;
-    let ip = probe.local_addr().ok()?.ip();
-    (!ip.is_unspecified()).then_some(ip)
-}
-
-fn show_code(code: &PairingCode, local: SocketAddr) {
+/// `discoverable`: the other machine can find this one on the LAN.
+fn show_code(code: &PairingCode, local: SocketAddr, discoverable: bool) {
     let host = match reachable_ip(local) {
         Some(ip) => SocketAddr::new(ip, local.port()).to_string(),
         None => format!("<this machine's IP>:{}", local.port()),
     };
+    let digits = code.digits();
     println!("pairing code: {code}");
-    println!(
-        "on the other machine run:\n  macwin pair {host} --code {}",
-        code.digits()
-    );
-    let _ = std::io::stdout().flush();
-}
-
-/// Waits for the other machine, burning the code after each failed attempt.
-async fn wait_for_pairing(listener: &PairListener, info: &PairInfo) -> anyhow::Result<PairedPeer> {
-    let local = listener.local_addr()?;
-    let deadline = tokio::time::Instant::now() + PAIR_WINDOW;
-    let mut code = PairingCode::generate()?;
-    show_code(&code, local);
-    let mut failures = 0;
-    loop {
-        let attempt = tokio::time::timeout_at(deadline, listener.accept(&code, info));
-        let result = tokio::select! {
-            r = attempt => r,
-            _ = tokio::signal::ctrl_c() => bail!("pairing cancelled"),
-        };
-        match result {
-            Err(_) => bail!(
-                "no machine paired within {} minutes",
-                PAIR_WINDOW.as_secs() / 60
-            ),
-            Ok(Ok(peer)) => return Ok(peer),
-            Ok(Err(NetError::PairingFailed(why))) => {
-                failures += 1;
-                eprintln!("pairing attempt failed: {why}");
-                if failures >= MAX_PAIR_ATTEMPTS {
-                    bail!("{failures} failed attempts; run `macwin pair` again");
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                code = PairingCode::generate()?;
-                println!("that code is used up; a new one:");
-                show_code(&code, local);
-            }
-            Ok(Err(NetError::EndpointClosed)) => bail!("the pairing listener closed"),
-            Ok(Err(e)) => warn!(error = %e, "a connection attempt failed; still waiting"),
-        }
+    if discoverable {
+        println!("on the other machine run:\n  macwin pair --code {digits}");
+        println!("or, if it does not find this machine:\n  macwin pair {host} --code {digits}");
+    } else {
+        println!("on the other machine run:\n  macwin pair {host} --code {digits}");
     }
+    let _ = std::io::stdout().flush();
 }
 
 fn prompt_code() -> anyhow::Result<PairingCode> {
@@ -151,36 +109,19 @@ fn prompt_code() -> anyhow::Result<PairingCode> {
     Ok(PairingCode::parse(&line)?)
 }
 
-/// This machine's view of the peer's side, from the local choice and the
-/// peer's choice ("its peer is on its left" means "it is on my right").
-pub fn agree_side(local: Option<Side>, peer_view: Option<Side>) -> Option<Side> {
-    match (local, peer_view) {
-        (Some(l), Some(p)) if l == p => {
-            eprintln!(
-                "warning: both machines put the other on the {}; keeping this machine's choice",
-                side_name(l)
-            );
-            Some(l)
-        }
-        (Some(l), _) => Some(l),
-        (None, Some(p)) => Some(p.opposite()),
-        (None, None) => None,
-    }
-}
-
 pub async fn pair(args: PairArgs) -> anyhow::Result<()> {
     let os = supported_os()?;
     let id = load_identity()?;
-    let mut config = Config::load(&id.config_dir)?;
+    let config = Config::load(&id.config_dir)?;
     let info = PairInfo {
         os,
         device_name: device_name(),
         peer_side: args.side.map(Side::from),
     };
-    let (peer, address) = match args.address {
-        Some(target) => {
+    let (peer, address) = match (args.address, args.code) {
+        (Some(target), code) => {
             let target = normalize_address(&target)?;
-            let code = match args.code {
+            let code = match code {
                 Some(c) => PairingCode::parse(&c)?,
                 None => prompt_code()?,
             };
@@ -192,31 +133,74 @@ pub async fn pair(args: PairArgs) -> anyhow::Result<()> {
                     .with_context(|| format!("pairing with {target} failed"))?;
             (peer, Some(target))
         }
-        None => {
+        (None, Some(code)) => {
+            let code = PairingCode::parse(&code)?;
+            println!("looking for the other machine on the local network");
+            let targets = discovery_targets(config.discovery_port);
+            let found = find_waiting(&config, id.identity.fingerprint(), &targets).await?;
+            println!(
+                "found \"{}\" ({}) at {}",
+                found.device_name,
+                os_name(found.os),
+                found.addr
+            );
+            let peer = macwin_net::pair_connect(
+                bind_for(found.addr),
+                found.addr,
+                &id.identity,
+                &code,
+                &info,
+            )
+            .await
+            .with_context(|| format!("pairing with {} failed", found.addr))?;
+            (peer, Some(found.addr.to_string()))
+        }
+        (None, None) => {
             let bind = args.listen.unwrap_or(config.listen);
             let listener = macwin_net::pair_listen(bind, &id.identity)
                 .await
                 .with_context(|| format!("cannot listen on {bind}"))?;
-            println!("listening on {}", listener.local_addr()?);
-            let result = wait_for_pairing(&listener, &info).await;
+            let local = listener.local_addr()?;
+            println!("listening on {local}");
+            let responder =
+                match pairing_responder(&config, local, &info, id.identity.fingerprint()).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "warning: the other machine cannot find this one by itself (UDP \
+                             port {}: {e}); type the address shown below there",
+                            config.discovery_port
+                        );
+                        None
+                    }
+                };
+            let discoverable = responder.is_some();
+            let show = |code: &PairingCode, used: Option<&str>| {
+                if let Some(why) = used {
+                    eprintln!("pairing attempt failed: {why}");
+                    println!("that code is used up; a new one:");
+                }
+                show_code(code, local, discoverable);
+            };
+            let result = tokio::select! {
+                r = wait_for_pairing(&listener, &info, show) => r,
+                _ = tokio::signal::ctrl_c() => Err(anyhow!("pairing cancelled")),
+            };
+            drop(responder);
             listener.shutdown().await;
             (result?, None)
         }
     };
-    let side = agree_side(info.peer_side, peer.peer_side);
-    if let Some(old) = &config.peer
-        && old.fingerprint != peer.fingerprint
-    {
-        println!("replacing the previously paired \"{}\"", old.name);
+    let (side, conflict) = agree_side(info.peer_side, peer.peer_side);
+    if let (Some(s), true) = (side, conflict) {
+        eprintln!(
+            "warning: both machines put the other on the {}; keeping this machine's choice",
+            side_name(s)
+        );
     }
-    config.peer = Some(PeerConfig {
-        fingerprint: peer.fingerprint,
-        name: peer.device_name.clone(),
-        os: peer.os,
-        side,
-        address,
-    });
-    config.save(&id.config_dir)?;
+    if let Some(old) = store_pairing(&id.config_dir, &peer, side, address)? {
+        println!("replaced the previously paired \"{old}\"");
+    }
     println!(
         "paired with \"{}\" ({}), fingerprint {}",
         peer.device_name,
@@ -261,6 +245,40 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn autostart(action: AutostartArg) -> anyhow::Result<()> {
+    supported_os()?;
+    let a = autostart::for_this_machine()?;
+    match action {
+        AutostartArg::On => {
+            if cfg!(target_os = "macos")
+                && let Ok(exe) = std::env::current_exe()
+                && autostart::app_bundle(&exe).is_none()
+            {
+                eprintln!(
+                    "warning: this macwin is not inside MacWin.app; macOS will ask for its \
+                     permissions separately"
+                );
+            }
+            a.enable()?;
+            println!("macwin starts at login ({})", a.describe());
+        }
+        AutostartArg::Off => {
+            a.disable()?;
+            println!("macwin no longer starts at login");
+        }
+        AutostartArg::Status => match a.state()? {
+            AutostartState::On => println!("on ({})", a.describe()),
+            AutostartState::Off => println!("off"),
+            AutostartState::Other => println!(
+                "on, but for another copy of macwin ({}); `macwin autostart on` switches it to \
+                 this one",
+                a.describe()
+            ),
+        },
+    }
+    Ok(())
+}
+
 // ---------- macwin run ----------
 
 fn print_event(e: RunEvent) {
@@ -268,6 +286,7 @@ fn print_event(e: RunEvent) {
         RunEvent::Listening(addr) => println!("listening on {addr}"),
         RunEvent::Dialing(target) => println!("connecting to {target}"),
         RunEvent::Connected { name, remote } => println!("connected to \"{name}\" ({remote})"),
+        RunEvent::PeerFound(addr) => println!("found the other machine at its new address {addr}"),
         RunEvent::Role(role) => info!(?role, "role"),
         RunEvent::Ended(end) => println!("session ended: {end:?}"),
         RunEvent::Retrying { after, error } if after.is_zero() => {
@@ -283,9 +302,18 @@ fn print_event(e: RunEvent) {
     let _ = std::io::stdout().flush();
 }
 
+/// The cache directory (the instance lock, received files, the tray log).
+fn cache_dir() -> anyhow::Result<PathBuf> {
+    Ok(macwin_net::cache_dir(|k| std::env::var_os(k))?)
+}
+
+const ALREADY_RUNNING: &str =
+    "macwin is already running on this machine (the tray or `macwin run`); quit it first";
+
 pub async fn run() -> anyhow::Result<()> {
     let os = supported_os()?;
     platform::init();
+    let _lock = instance::acquire(&cache_dir()?)?.context(ALREADY_RUNNING)?;
     let id = load_identity()?;
     let config = Config::load(&id.config_dir)?;
     let peer = config.peer.clone().context(
@@ -294,19 +322,10 @@ pub async fn run() -> anyhow::Result<()> {
     let side = peer
         .side
         .context("tell macwin where the peer's screens are: macwin config set side left|right")?;
-    let staging = macwin_net::cache_dir(|k| std::env::var_os(k))?.join("incoming");
-    let c = &config.clipboard;
-    let clipboard = c.enabled.then(|| ClipboardSettings {
-        max_text_bytes: c.max_text_bytes(),
-        images: c.images,
-        max_image_bytes: macwin_proto::MAX_CLIPBOARD_IMAGE,
-        files: c.files,
-        max_files_bytes: c.max_files_bytes(),
-        staging,
-        poll: crate::clipboard::POLL_INTERVAL,
-    });
-    let with_clipboard = clipboard.is_some();
-    let sharing = match &clipboard {
+    let staging = staging_dir()?;
+    let session = session_config(&config, os, device_name(), side, staging);
+    let with_clipboard = session.clipboard.is_some();
+    let sharing = match &session.clipboard {
         None => "off".to_string(),
         Some(s) => {
             let mut kinds = vec!["text"];
@@ -319,19 +338,11 @@ pub async fn run() -> anyhow::Result<()> {
             kinds.join(", ")
         }
     };
-    let session = SessionConfig {
-        local_os: os,
-        os_version: String::new(),
-        device_name: device_name(),
-        peer_side: side,
-        remap: config.remap,
-        timings: Timings::default(),
-        clipboard,
-    };
     let mode = match &peer.address {
         Some(a) => Mode::Dial(a.clone()),
         None => Mode::Listen(config.listen),
     };
+    let discovery = run_discovery(&config);
     println!(
         "sharing with \"{}\" ({}), whose screens are on the {}; clipboard: {sharing}",
         peer.name,
@@ -351,12 +362,21 @@ pub async fn run() -> anyhow::Result<()> {
         retry_min: runner::RETRY_MIN,
         retry_max: runner::RETRY_MAX,
         connect_timeout: runner::CONNECT_TIMEOUT,
+        discovery,
+    };
+    let dir = id.config_dir.clone();
+    let peer_fp = peer.fingerprint;
+    let on_event = move |e: RunEvent| {
+        if let RunEvent::PeerFound(addr) = &e {
+            save_found_address(&dir, peer_fp, *addr);
+        }
+        print_event(e);
     };
     let exit = runner::run(
         opts,
         id.identity,
         || platform::backends(with_clipboard),
-        print_event,
+        on_event,
         stop_rx,
     )
     .await?;
@@ -365,6 +385,127 @@ pub async fn run() -> anyhow::Result<()> {
         RunExit::EmergencyStop => println!("stopped by the emergency chord"),
     }
     Ok(())
+}
+
+/// Where received files wait until they are pasted.
+pub fn staging_dir() -> anyhow::Result<PathBuf> {
+    Ok(cache_dir()?.join("incoming"))
+}
+
+// ---------- macwin tray ----------
+
+/// The tray (`macwin tray`, MacWin.app, macwin-tray.exe): the UI runs on
+/// this (main) thread, everything else on a tokio runtime. Logs go to a
+/// file; errors before the UI is up are also shown in an alert.
+pub fn tray() -> anyhow::Result<()> {
+    let log = logging::log_path(|k| std::env::var_os(k));
+    match &log {
+        Some(path) => {
+            if let Err(e) = logging::init_file(path) {
+                logging::init();
+                warn!(error = %e, path = %path.display(), "cannot open the log file");
+            }
+        }
+        None => logging::init(),
+    }
+    let result = run_tray_app();
+    if let Err(e) = &result {
+        error!(error = %format!("{e:#}"), "the tray stopped");
+        platform::alert("macwin", &format!("macwin cannot start: {e:#}"));
+    }
+    result
+}
+
+fn run_tray_app() -> anyhow::Result<()> {
+    let os = supported_os()?;
+    platform::init();
+    let Some(_lock) = instance::acquire(&cache_dir()?)? else {
+        info!("another macwin is running");
+        platform::alert("macwin", ALREADY_RUNNING);
+        return Ok(());
+    };
+    let id = load_identity()?;
+    info!(version = env!("CARGO_PKG_VERSION"), "tray starting");
+    let make_backends: MakeBackends = Arc::new(platform::backends);
+    let discovery_targets: DiscoveryTargets = Arc::new(discovery_targets);
+    let env = TrayEnv {
+        config_dir: id.config_dir,
+        identity: id.identity,
+        os,
+        device_name: device_name(),
+        staging: staging_dir()?,
+        make_backends,
+        autostart: autostart::for_this_machine().ok(),
+        discovery_targets,
+        discovery_wait: DISCOVERY_WAIT,
+        retry_min: runner::RETRY_MIN,
+        retry_max: runner::RETRY_MAX,
+        connect_timeout: runner::CONNECT_TIMEOUT,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("cannot start the runtime")?;
+    let (app, controller) = tray::start(env);
+    let controller = runtime.spawn(controller);
+    let quitter = app.clone();
+    runtime.spawn(async move {
+        // Without a console (macwin-tray.exe) this never fires; an error must not quit.
+        if tokio::signal::ctrl_c().await.is_ok() {
+            quitter.quit();
+        }
+    });
+    // On macOS this ends the process once the controller has finished.
+    platform::run_tray(app.clone())?;
+    let _ = runtime.block_on(tokio::time::timeout(Duration::from_secs(5), controller));
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    Ok(())
+}
+
+/// The session settings `config` asks for.
+pub fn session_config(
+    config: &Config,
+    os: macwin_core::types::Os,
+    device_name: String,
+    side: Side,
+    staging: PathBuf,
+) -> SessionConfig {
+    let c = &config.clipboard;
+    SessionConfig {
+        local_os: os,
+        os_version: String::new(),
+        device_name,
+        peer_side: side,
+        remap: config.remap,
+        timings: Timings::default(),
+        clipboard: c.enabled.then(|| ClipboardSettings {
+            max_text_bytes: c.max_text_bytes(),
+            images: c.images,
+            max_image_bytes: macwin_proto::MAX_CLIPBOARD_IMAGE,
+            files: c.files,
+            max_files_bytes: c.max_files_bytes(),
+            staging,
+            poll: crate::clipboard::POLL_INTERVAL,
+        }),
+    }
+}
+
+/// LAN discovery settings of the run loop, from the config.
+pub fn run_discovery(config: &Config) -> Option<RunDiscovery> {
+    config.discovery.then(|| RunDiscovery {
+        responder: responder_addr(config.listen, config.discovery_port),
+        targets: discovery_targets(config.discovery_port),
+        wait: DISCOVERY_WAIT,
+    })
+}
+
+/// Stores the peer's new address (see [`remember_peer_address`]).
+pub fn save_found_address(dir: &Path, peer: Fingerprint, addr: SocketAddr) {
+    match remember_peer_address(dir, peer, addr) {
+        Ok(true) => info!(%addr, "saved the other machine's new address"),
+        Ok(false) => {}
+        Err(e) => warn!(error = %format!("{e:#}"), "cannot save the other machine's new address"),
+    }
 }
 
 /// Listens until one peer completes the handshake.

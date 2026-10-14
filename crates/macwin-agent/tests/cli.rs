@@ -234,6 +234,72 @@ fn two_processes_pair_with_a_code() {
     assert!(!config_of(pc.path()).contains("[peer]"));
 }
 
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[test]
+fn pairing_with_only_the_code_finds_the_waiting_machine() {
+    let mac = tempfile::tempdir().unwrap();
+    let pc = tempfile::tempdir().unwrap();
+    let port = free_udp_port().to_string();
+    for dir in [mac.path(), pc.path()] {
+        let out = macwin(dir)
+            .args(["config", "set", "discovery-port", &port])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    let fp_pc = fingerprint_of(pc.path());
+    let mut waiting = Guard(
+        macwin(pc.path())
+            .args(["pair", "--listen", "127.0.0.1:0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let lines = lines_of(&mut waiting);
+    let addr = wait_line(&lines, "listening on ");
+    let code = wait_line(&lines, "pairing code: ");
+    // The waiting side answers discovery, so it suggests the short command.
+    let digits = wait_line(&lines, "  macwin pair --code ");
+    assert_eq!(digits, code.replace('-', ""));
+    let good = macwin(mac.path())
+        .args(["pair", "--code", &code])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&good.stdout);
+    assert!(
+        good.status.success(),
+        "{out}\n{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert!(out.contains(&format!(") at {addr}")), "{out}");
+    assert!(out.contains("paired with"), "{out}");
+    let waited = wait_with_timeout(waiting, Duration::from_secs(10));
+    assert!(waited.status.success(), "{waited:?}");
+    let mac_cfg = config_of(mac.path());
+    assert!(
+        mac_cfg.contains(&fp_pc) && mac_cfg.contains(&format!("address = \"{addr}\"")),
+        "{mac_cfg}"
+    );
+    // Nobody waits any more: the next attempt explains what to do.
+    let none = macwin(mac.path())
+        .args(["pair", "--code", "123456"])
+        .output()
+        .unwrap();
+    assert!(!none.status.success());
+    assert!(
+        String::from_utf8_lossy(&none.stderr).contains("no machine on this network is waiting"),
+        "{none:?}"
+    );
+}
+
 #[test]
 fn run_without_a_pairing_explains_what_to_do() {
     let dir = tempfile::tempdir().unwrap();

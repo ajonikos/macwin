@@ -1,9 +1,9 @@
 //! Codec unit tests: every validation rule, version checks and property tests.
 
 use macwin_core::msg::{
-    ButtonMsg, ClipboardMsg, ClipboardText, ControlMsg, DatagramMsg, Enter, Heartbeat, Hello,
-    InputMsg, KeyMsg, Leave, MouseAbs, PairConfirm, PairHello, PairMsg, Ping, Pong, TakeControl,
-    WheelMsg,
+    ButtonMsg, ClipboardMsg, ClipboardText, ControlMsg, DatagramMsg, DiscoveryAnswer, DiscoveryMsg,
+    DiscoveryOffer, DiscoveryQuery, DiscoverySeek, Enter, Heartbeat, Hello, InputMsg, KeyMsg,
+    Leave, MouseAbs, PairConfirm, PairHello, PairMsg, Ping, Pong, TakeControl, WheelMsg,
 };
 use macwin_core::types::{
     Hid, ModifierMask, MouseButton, Os, Point, Rect, RoleKind, ScreenInfo, Side, WheelUnit,
@@ -744,4 +744,155 @@ proptest! {
         let _ = decode_clipboard(&bytes);
         let _ = decode_pair(&bytes);
     }
+}
+
+fn discovery_answer(offer: DiscoveryOffer) -> DiscoveryMsg {
+    DiscoveryMsg::Answer(DiscoveryAnswer {
+        protocol_version: PROTOCOL_VERSION,
+        nonce: [3; 16],
+        port: 47800,
+        offer,
+    })
+}
+
+#[test]
+fn discovery_messages_round_trip() {
+    let msgs = [
+        DiscoveryMsg::Query(DiscoveryQuery {
+            protocol_version: PROTOCOL_VERSION,
+            nonce: [1; 16],
+            seek: DiscoverySeek::Pairing,
+        }),
+        DiscoveryMsg::Query(DiscoveryQuery {
+            protocol_version: PROTOCOL_VERSION,
+            nonce: [2; 16],
+            seek: DiscoverySeek::Peer {
+                target: [4; 32],
+                sender: [5; 32],
+            },
+        }),
+        discovery_answer(DiscoveryOffer::Pairing {
+            os: Os::Windows,
+            device_name: "DESKTOP-1".into(),
+            fingerprint: [6; 32],
+        }),
+        discovery_answer(DiscoveryOffer::Peer { proof: [7; 32] }),
+    ];
+    for m in msgs {
+        let bytes = encode_discovery(&m);
+        assert!(bytes.starts_with(&DISCOVERY_MAGIC));
+        assert!(bytes.len() <= MAX_DISCOVERY_LEN, "{} bytes", bytes.len());
+        assert_eq!(decode_discovery(&bytes).unwrap(), m);
+    }
+    // The longest valid answer still fits.
+    let long = discovery_answer(DiscoveryOffer::Pairing {
+        os: Os::MacOs,
+        device_name: "x".repeat(MAX_STRING_LEN),
+        fingerprint: [8; 32],
+    });
+    assert!(encode_discovery(&long).len() <= MAX_DISCOVERY_LEN);
+}
+
+fn decode_discovery_frame(k: wire::discovery_frame::Kind) -> Result<DiscoveryMsg, ProtoError> {
+    let mut b = DISCOVERY_MAGIC.to_vec();
+    b.extend_from_slice(&wire::DiscoveryFrame { kind: Some(k) }.encode_to_vec());
+    decode_discovery(&b)
+}
+
+fn valid_wire_answer() -> wire::DiscoveryAnswer {
+    wire::DiscoveryAnswer {
+        protocol_version: PROTOCOL_VERSION,
+        nonce: vec![1; 16],
+        port: 47800,
+        offer: Some(wire::discovery_answer::Offer::Pairing(wire::OfferPairing {
+            os: wire::Os::Macos as i32,
+            device_name: "mac".into(),
+            fingerprint: vec![2; 32],
+        })),
+    }
+}
+
+#[test]
+fn discovery_messages_are_validated() {
+    use wire::discovery_frame::Kind;
+    let ok = encode_discovery(&discovery_answer(DiscoveryOffer::Peer { proof: [1; 32] }));
+    // Other traffic on the port: wrong magic, empty, oversized.
+    let mut wrong = ok.clone();
+    wrong[0] = b'X';
+    assert_invalid_value(decode_discovery(&wrong), "discovery datagram");
+    assert_invalid_value(decode_discovery(&[]), "discovery datagram");
+    let mut big = ok.clone();
+    big.resize(MAX_DISCOVERY_LEN + 1, 0);
+    assert_invalid_value(decode_discovery(&big), "discovery datagram");
+    assert!(matches!(
+        decode_discovery(&DISCOVERY_MAGIC),
+        Err(ProtoError::UnknownKind("discovery frame"))
+    ));
+    // Queries.
+    let query = |nonce: Vec<u8>, seek| {
+        decode_discovery_frame(Kind::Query(wire::DiscoveryQuery {
+            protocol_version: PROTOCOL_VERSION,
+            nonce,
+            seek,
+        }))
+    };
+    let pairing = || Some(wire::discovery_query::Seek::Pairing(wire::SeekPairing {}));
+    assert!(query(vec![0; 16], pairing()).is_ok());
+    assert_invalid_value(query(vec![0; 15], pairing()), "discovery.nonce");
+    assert!(matches!(
+        query(vec![0; 16], None),
+        Err(ProtoError::UnknownKind("discovery query"))
+    ));
+    let peer = |target: usize, sender: usize| {
+        Some(wire::discovery_query::Seek::Peer(wire::SeekPeer {
+            target: vec![1; target],
+            sender: vec![2; sender],
+        }))
+    };
+    assert!(query(vec![0; 16], peer(32, 32)).is_ok());
+    assert_invalid_value(query(vec![0; 16], peer(31, 32)), "discovery.target");
+    assert_invalid_value(query(vec![0; 16], peer(32, 33)), "discovery.sender");
+    // Answers.
+    assert!(decode_discovery_frame(Kind::Answer(valid_wire_answer())).is_ok());
+    for port in [0, 65_536] {
+        let mut a = valid_wire_answer();
+        a.port = port;
+        assert_invalid_value(decode_discovery_frame(Kind::Answer(a)), "discovery.port");
+    }
+    let mut a = valid_wire_answer();
+    a.nonce = vec![];
+    assert_invalid_value(decode_discovery_frame(Kind::Answer(a)), "discovery.nonce");
+    let mut a = valid_wire_answer();
+    a.offer = None;
+    assert!(matches!(
+        decode_discovery_frame(Kind::Answer(a)),
+        Err(ProtoError::UnknownKind("discovery answer"))
+    ));
+    let with_offer = |offer| {
+        let mut a = valid_wire_answer();
+        a.offer = Some(offer);
+        decode_discovery_frame(Kind::Answer(a))
+    };
+    let pairing_offer = |os: i32, name: String, fp: usize| {
+        wire::discovery_answer::Offer::Pairing(wire::OfferPairing {
+            os,
+            device_name: name,
+            fingerprint: vec![3; fp],
+        })
+    };
+    assert_invalid_enum(with_offer(pairing_offer(7, "a".into(), 32)), "discovery.os");
+    assert_invalid_value(
+        with_offer(pairing_offer(1, "a".repeat(257), 32)),
+        "discovery.device_name",
+    );
+    assert_invalid_value(
+        with_offer(pairing_offer(1, "a".into(), 20)),
+        "discovery.fingerprint",
+    );
+    assert_invalid_value(
+        with_offer(wire::discovery_answer::Offer::Peer(wire::OfferPeer {
+            proof: vec![1; 8],
+        })),
+        "discovery.proof",
+    );
 }

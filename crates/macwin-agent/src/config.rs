@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow, bail};
 use macwin_core::types::{Os, Side};
 use macwin_net::Fingerprint;
+use macwin_net::discovery::DISCOVERY_PORT;
 use macwin_platform::fs::{create_private_dir, write_atomic};
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,11 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Swap Ctrl and Cmd/Win when controlling the other OS.
     pub remap: bool,
+    /// Answer and send LAN discovery broadcasts (finding the machine that
+    /// waits for pairing, and the peer after its address changed).
+    pub discovery: bool,
+    /// The UDP port of LAN discovery.
+    pub discovery_port: u16,
     pub clipboard: ClipboardConfig,
     pub peer: Option<PeerConfig>,
 }
@@ -80,6 +86,8 @@ impl Default for Config {
         Config {
             listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
             remap: true,
+            discovery: true,
+            discovery_port: DISCOVERY_PORT,
             clipboard: ClipboardConfig {
                 enabled: true,
                 max_text_kb: DEFAULT_CLIPBOARD_MAX_KB,
@@ -97,6 +105,8 @@ impl Default for Config {
 struct RawConfig {
     listen: String,
     remap: bool,
+    discovery: bool,
+    discovery_port: u16,
     clipboard: RawClipboard,
     #[serde(skip_serializing_if = "Option::is_none")]
     peer: Option<RawPeer>,
@@ -206,6 +216,13 @@ fn check_max_mb(mb: u32) -> anyhow::Result<u32> {
     }
 }
 
+fn check_port(port: u16) -> anyhow::Result<u16> {
+    if port == 0 {
+        bail!("discovery_port: expected 1..=65535, got 0")
+    }
+    Ok(port)
+}
+
 fn parse_bool(key: &str, v: &str) -> anyhow::Result<bool> {
     match v {
         "on" | "true" | "yes" | "1" => Ok(true),
@@ -219,6 +236,8 @@ impl From<&Config> for RawConfig {
         RawConfig {
             listen: c.listen.to_string(),
             remap: c.remap,
+            discovery: c.discovery,
+            discovery_port: c.discovery_port,
             clipboard: RawClipboard {
                 enabled: c.clipboard.enabled,
                 max_text_kb: c.clipboard.max_text_kb,
@@ -271,6 +290,8 @@ impl TryFrom<RawConfig> for Config {
         Ok(Config {
             listen,
             remap: r.remap,
+            discovery: r.discovery,
+            discovery_port: check_port(r.discovery_port)?,
             clipboard: ClipboardConfig {
                 enabled: r.clipboard.enabled,
                 max_text_kb: check_max_kb(r.clipboard.max_text_kb)?,
@@ -348,6 +369,13 @@ impl Config {
                     .map_err(|_| anyhow!("listen: expected ADDR:PORT, got {value:?}"))?;
             }
             "remap" => self.remap = parse_bool(key, value)?,
+            "discovery" => self.discovery = parse_bool(key, value)?,
+            "discovery-port" => {
+                let port = value
+                    .parse()
+                    .map_err(|_| anyhow!("discovery-port: expected 1-65535, got {value:?}"))?;
+                self.discovery_port = check_port(port)?;
+            }
             "clipboard" => self.clipboard.enabled = parse_bool(key, value)?,
             "clipboard-max-kb" => {
                 let kb = value
@@ -364,12 +392,37 @@ impl Config {
                 self.clipboard.max_files_mb = check_max_mb(mb)?;
             }
             _ => bail!(
-                "unknown key {key:?}; keys: side, address, listen, remap, clipboard, \
-                 clipboard-max-kb, clipboard-images, clipboard-files, clipboard-files-max-mb"
+                "unknown key {key:?}; keys: side, address, listen, remap, discovery, \
+                 discovery-port, clipboard, clipboard-max-kb, clipboard-images, \
+                 clipboard-files, clipboard-files-max-mb"
             ),
         }
         Ok(())
     }
+}
+
+/// After the paired peer answered from `addr`: stores it as the peer's
+/// address when the configured one is an IP address. Hostnames stay (they
+/// may only be unresolvable for a while), and so does a config that was
+/// re-paired meanwhile. Re-reads the file, so concurrent edits survive.
+/// True when the file changed.
+pub fn remember_peer_address(
+    dir: &Path,
+    peer: Fingerprint,
+    addr: SocketAddr,
+) -> anyhow::Result<bool> {
+    let mut config = Config::load(dir)?;
+    let Some(p) = config.peer.as_mut().filter(|p| p.fingerprint == peer) else {
+        return Ok(false);
+    };
+    let new = addr.to_string();
+    match &p.address {
+        Some(a) if *a == new || a.parse::<SocketAddr>().is_err() => return Ok(false),
+        None => return Ok(false),
+        Some(_) => p.address = Some(new),
+    }
+    config.save(dir)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -399,6 +452,7 @@ mod tests {
         let d = Config::default();
         assert_eq!(d.listen.port(), DEFAULT_PORT);
         assert!(d.remap && d.clipboard.enabled && d.peer.is_none());
+        assert!(d.discovery && d.discovery_port == DISCOVERY_PORT);
         assert_eq!(d.clipboard.max_text_bytes(), 4096 * 1024);
     }
 
@@ -424,6 +478,8 @@ mod tests {
             ("listen = \"nope\"", "listen"),
             ("lsiten = \"0.0.0.0:1\"", "unknown field"),
             ("[clipboard]\nmax_text_kb = 0", "max_text_kb"),
+            ("discovery_port = 0", "discovery_port"),
+            ("discovery_port = 70000", "discovery_port"),
             ("[clipboard]\nmax_text_kb = 99999", "max_text_kb"),
             ("[clipboard]\nenable = true", "unknown field"),
             (
@@ -480,6 +536,36 @@ mod tests {
     }
 
     #[test]
+    fn found_addresses_replace_ip_addresses_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp: Fingerprint = FP.parse().unwrap();
+        let new: SocketAddr = "192.168.1.77:47800".parse().unwrap();
+        // Not paired, or paired with another machine: nothing changes.
+        assert!(!remember_peer_address(dir.path(), fp, new).unwrap());
+        let mut other = paired();
+        other.peer.as_mut().unwrap().fingerprint = Fingerprint([9; 32]);
+        other.save(dir.path()).unwrap();
+        assert!(!remember_peer_address(dir.path(), fp, new).unwrap());
+        // An IP address is replaced, then nothing is left to change.
+        paired().save(dir.path()).unwrap();
+        assert!(remember_peer_address(dir.path(), fp, new).unwrap());
+        let peer = Config::load(dir.path()).unwrap().peer.unwrap();
+        assert_eq!(peer.address.as_deref(), Some("192.168.1.77:47800"));
+        assert!(!remember_peer_address(dir.path(), fp, new).unwrap());
+        // A hostname stays, and a listening machine does not start dialing.
+        for address in [Some("pc.local:47800".to_string()), None] {
+            let mut c = paired();
+            c.peer.as_mut().unwrap().address = address.clone();
+            c.save(dir.path()).unwrap();
+            assert!(!remember_peer_address(dir.path(), fp, new).unwrap());
+            assert_eq!(
+                Config::load(dir.path()).unwrap().peer.unwrap().address,
+                address
+            );
+        }
+    }
+
+    #[test]
     fn set_updates_and_validates() {
         let mut c = Config::default();
         assert!(
@@ -504,6 +590,11 @@ mod tests {
         assert!(c.set("clipboard-files-max-mb", "0").is_err());
         assert!(c.set("clipboard-files-max-mb", "70000").is_err());
         assert!(c.set("remap", "maybe").is_err());
+        c.set("discovery", "off").unwrap();
+        c.set("discovery-port", "5001").unwrap();
+        assert!(!c.discovery && c.discovery_port == 5001);
+        assert!(c.set("discovery-port", "0").is_err());
+        assert!(c.set("discovery-port", "x").is_err());
         assert!(c.set("colour", "red").is_err());
         let mut p = paired();
         p.set("side", "none").unwrap();

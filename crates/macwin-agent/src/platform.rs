@@ -4,7 +4,7 @@ use std::path::Path;
 
 use macwin_platform::{FileSecretStore, PlatformError, SecretStore};
 
-pub use imp::{capture, clipboard, init, injector, permissions_report, screens};
+pub use imp::{alert, capture, clipboard, init, injector, permissions_report, run_tray, screens};
 
 use crate::driver::Backends;
 use crate::identity_store::KeyStoreKind;
@@ -44,17 +44,28 @@ pub fn device_name() -> String {
 #[cfg(target_os = "macos")]
 mod imp {
     use std::path::Path;
+    use std::sync::Arc;
 
+    use macwin_platform::tray::TrayApp;
     use macwin_platform::{
         ClipboardBackend, InputCapture, InputInjector, PlatformError, ScreenSource, SecretStore,
     };
     use macwin_platform_macos::{
-        KeychainStore, MacCapture, MacClipboard, MacInjector, MacScreens, permissions,
+        KeychainStore, MacCapture, MacClipboard, MacInjector, MacScreens, permissions, tray,
     };
 
     use crate::identity_store::KeyStoreKind;
 
     pub fn init() {}
+
+    /// The menu bar item; on the main thread, until the app has finished.
+    pub fn run_tray(app: Arc<dyn TrayApp>) -> Result<(), PlatformError> {
+        tray::run(app)
+    }
+
+    pub fn alert(title: &str, message: &str) {
+        tray::alert(title, message);
+    }
 
     pub fn screens() -> Box<dyn ScreenSource> {
         Box::new(MacScreens)
@@ -118,12 +129,14 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use std::path::Path;
+    use std::sync::Arc;
 
+    use macwin_platform::tray::TrayApp;
     use macwin_platform::{
         ClipboardBackend, InputCapture, InputInjector, PlatformError, ScreenSource, SecretStore,
     };
     use macwin_platform_windows::{
-        DpapiStore, WinCapture, WinClipboard, WinInjector, WinScreens, init_dpi_awareness,
+        DpapiStore, WinCapture, WinClipboard, WinInjector, WinScreens, init_dpi_awareness, tray,
     };
 
     use crate::identity_store::KeyStoreKind;
@@ -131,6 +144,15 @@ mod imp {
     /// Per-monitor-v2 DPI awareness; must run before any backend is used.
     pub fn init() {
         let _ = init_dpi_awareness();
+    }
+
+    /// The notification area icon, until the app has finished.
+    pub fn run_tray(app: Arc<dyn TrayApp>) -> Result<(), PlatformError> {
+        tray::run(app)
+    }
+
+    pub fn alert(title: &str, message: &str) {
+        tray::alert(title, message);
     }
 
     pub fn screens() -> Box<dyn ScreenSource> {
@@ -174,7 +196,9 @@ mod imp {
 #[cfg(not(any(target_os = "macos", windows)))]
 mod imp {
     use std::path::Path;
+    use std::sync::Arc;
 
+    use macwin_platform::tray::TrayApp;
     use macwin_platform::{
         ClipboardBackend, InputCapture, InputInjector, PlatformError, ScreenSource, SecretStore,
         UnsupportedPlatform,
@@ -183,6 +207,14 @@ mod imp {
     use crate::identity_store::KeyStoreKind;
 
     pub fn init() {}
+
+    pub fn run_tray(_app: Arc<dyn TrayApp>) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported)
+    }
+
+    pub fn alert(title: &str, message: &str) {
+        eprintln!("{title}: {message}");
+    }
 
     pub fn screens() -> Box<dyn ScreenSource> {
         Box::new(UnsupportedPlatform)

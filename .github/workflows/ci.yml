@@ -35,6 +35,85 @@ jobs:
       - name: Generated keymap is up to date
         run: cargo run -p keymap-gen --locked -- --check
 
+  # Builds the release packages and smoke-tests them: the dmg mounts and holds
+  # a validly signed app; the Windows zip installs (files, Run key, firewall
+  # rules) and uninstalls without leftovers. The packages stay as artifacts.
+  package:
+    name: package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.96.0
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Build MacWin.app and the dmg
+        if: runner.os == 'macOS'
+        run: scripts/macos/dmg.sh
+      - name: Check the dmg
+        if: runner.os == 'macOS'
+        run: |
+          mnt="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" target/MacWin-*.dmg
+          test -L "$mnt/Applications"
+          codesign --verify --strict --verbose=2 "$mnt/MacWin.app"
+          "$mnt/MacWin.app/Contents/MacOS/macwin" --version
+          hdiutil detach "$mnt"
+      - name: Build the zip
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          MACWIN_WINDOWS_TARGET: x86_64-pc-windows-msvc
+        run: scripts/windows/package.sh
+      - name: Install, check and uninstall
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          # A user PATH like the one Windows creates: REG_EXPAND_SZ with an unexpanded entry.
+          $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+          $marker = '%USERPROFILE%\macwin-ci-marker'
+          $envKey.SetValue('Path', $marker, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+          function Assert-UserPath([bool]$installed) {
+            $raw = $envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $parts = $raw -split ';'
+            if ($envKey.GetValueKind('Path') -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) { throw "PATH lost its type: $raw" }
+            if ($parts -notcontains $marker) { throw "PATH lost an unexpanded entry: $raw" }
+            if (($parts -contains $dest) -ne $installed) { throw "unexpected PATH: $raw" }
+          }
+          $stage = Join-Path $env:RUNNER_TEMP 'stage'
+          Expand-Archive -Path (Get-Item target/macwin-*-windows-x64.zip) -DestinationPath $stage
+          $installer = Get-ChildItem $stage -Recurse -Filter install.ps1 | Select-Object -First 1
+          $dest = Join-Path $env:RUNNER_TEMP 'macwin'
+          & $installer.FullName -Destination $dest -NoStart
+          Assert-UserPath $true
+          $run = (Get-ItemProperty $runKey).macwin
+          if ($run -ne "`"$dest\macwin-tray.exe`"") { throw "unexpected Run value: $run" }
+          if (@(Get-NetFirewallRule -Group 'macwin').Count -ne 2) { throw 'firewall rules missing' }
+          & "$dest\macwin.exe" autostart status
+          if ($LASTEXITCODE -ne 0) { throw 'macwin autostart status failed' }
+          # From inside the folder it removes, as "Run with PowerShell" starts it.
+          $p = Start-Process powershell.exe -WorkingDirectory $dest -Wait -PassThru -NoNewWindow `
+            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$dest\uninstall.ps1", '-Destination', $dest
+          if ($p.ExitCode -ne 0) { throw "uninstall.ps1 failed with exit code $($p.ExitCode)" }
+          Assert-UserPath $false
+          if (Test-Path $dest) { throw 'the program folder is left' }
+          if ((Get-ItemProperty $runKey).macwin) { throw 'the Run value is left' }
+          if (Get-NetFirewallRule -Group 'macwin' -ErrorAction SilentlyContinue) { throw 'firewall rules are left' }
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: macwin-${{ runner.os }}
+          path: |
+            target/MacWin-*.dmg
+            target/macwin-*-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
   # cargo-deny-action is a Docker action and only runs on Linux; deny.toml's
   # [graph] targets make it check the macOS and Windows dependency graphs.
   deny:

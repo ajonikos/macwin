@@ -2,6 +2,7 @@
 //! Engine and the platform backends, shared by the `macwin` binary and tests.
 #![forbid(unsafe_code)]
 
+pub mod autostart;
 pub mod cli;
 pub mod commands;
 pub mod driver;
@@ -14,9 +15,13 @@ use macwin_core::types::Os;
 pub mod clipboard;
 pub mod config;
 pub mod identity_store;
+pub mod instance;
+pub mod lan;
+pub mod pairing;
 pub mod runner;
 pub mod sharing;
 pub mod transfer;
+pub mod tray;
 
 /// The OS this binary runs on, if macwin supports it.
 pub fn host_os() -> Option<Os> {

@@ -18,7 +18,8 @@ undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 lto = "thin"
-debug = "line-tables-only"
+# Releases ship without symbols or debug info (macwin.exe had 38 MB of them).
+strip = true
 # `panic` stays `unwind`: FFI callbacks rely on `catch_unwind`.
 
 [workspace.dependencies]
@@ -71,19 +72,40 @@ objc2-core-graphics = { version = "=0.3.2", default-features = false, features =
 ] }
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "std",
+    "objc2-core-foundation",
+    "NSAlert",
+    "NSApplication",
     "NSBitmapImageRep",
+    "NSButton",
+    "NSCell",
+    "NSControl",
     "NSEvent",
+    "NSImage",
     "NSImageRep",
+    "NSMenu",
+    "NSMenuItem",
     "NSPasteboard",
     "NSPasteboardItem",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
 ] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "std",
     "NSArray",
     "NSData",
+    "NSDate",
     "NSDictionary",
+    "NSGeometry",
     "NSProcessInfo",
+    "NSRunLoop",
     "NSString",
+    "NSTimer",
     "NSURL",
 ] }
 security-framework = { version = "=3.7.0", default-features = false }
@@ -95,6 +117,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
