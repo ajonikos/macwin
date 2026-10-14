@@ -75,17 +75,33 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          # A user PATH like the one Windows creates: REG_EXPAND_SZ with an unexpanded entry.
+          $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+          $marker = '%USERPROFILE%\macwin-ci-marker'
+          $envKey.SetValue('Path', $marker, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+          function Assert-UserPath([bool]$installed) {
+            $raw = $envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $parts = $raw -split ';'
+            if ($envKey.GetValueKind('Path') -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) { throw "PATH lost its type: $raw" }
+            if ($parts -notcontains $marker) { throw "PATH lost an unexpanded entry: $raw" }
+            if (($parts -contains $dest) -ne $installed) { throw "unexpected PATH: $raw" }
+          }
           $stage = Join-Path $env:RUNNER_TEMP 'stage'
           Expand-Archive -Path (Get-Item target/macwin-*-windows-x64.zip) -DestinationPath $stage
           $installer = Get-ChildItem $stage -Recurse -Filter install.ps1 | Select-Object -First 1
           $dest = Join-Path $env:RUNNER_TEMP 'macwin'
           & $installer.FullName -Destination $dest -NoStart
+          Assert-UserPath $true
           $run = (Get-ItemProperty $runKey).macwin
           if ($run -ne "`"$dest\macwin-tray.exe`"") { throw "unexpected Run value: $run" }
           if (@(Get-NetFirewallRule -Group 'macwin').Count -ne 2) { throw 'firewall rules missing' }
           & "$dest\macwin.exe" autostart status
           if ($LASTEXITCODE -ne 0) { throw 'macwin autostart status failed' }
-          & "$dest\uninstall.ps1" -Destination $dest
+          # From inside the folder it removes, as "Run with PowerShell" starts it.
+          $p = Start-Process powershell.exe -WorkingDirectory $dest -Wait -PassThru -NoNewWindow `
+            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$dest\uninstall.ps1", '-Destination', $dest
+          if ($p.ExitCode -ne 0) { throw "uninstall.ps1 failed with exit code $($p.ExitCode)" }
+          Assert-UserPath $false
           if (Test-Path $dest) { throw 'the program folder is left' }
           if ((Get-ItemProperty $runKey).macwin) { throw 'the Run value is left' }
           if (Get-NetFirewallRule -Group 'macwin' -ErrorAction SilentlyContinue) { throw 'firewall rules are left' }
