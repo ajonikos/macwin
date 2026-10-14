@@ -225,7 +225,8 @@ under **Paste from Other Apps**. `bundle.sh` signs with
 permissions and keychain access survive rebuilds.
 
 Known limits: windows of elevated (admin) Windows apps, the Windows lock
-screen and UAC prompts do not accept remote input yet; macOS Secure Input
+screen and UAC prompts do not accept remote input yet (the planned SYSTEM
+service is designed in `.agents/tasks/phase4-design.md`); macOS Secure Input
 (password fields) hides keystrokes from macwin while active. Copied files travel when they are
 copied, not when they are pasted, so a large copy takes a moment to become
 pasteable on the other machine. LAN discovery uses IPv4 broadcasts: across
