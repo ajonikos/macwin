@@ -54,3 +54,10 @@ cargo-deny (rustls 0.23.46, PR #1); Phase 3 is stacked on it.
 
 ## Status
 - Step 0 done: rustls 0.23.46 (PR #1).
+- Steps 1-7 done, one commit each (user: commit every important change): discovery messages,
+  net discovery, agent discovery use (+ shared pairing module), autostart, tray controller,
+  macOS menu bar, Windows notification area, entry points (tray command, macwin-tray.exe,
+  instance lock, log file), packaging, CI package job, README, Phase 4 design, this report.
+- Notes: binds retry while a just-closed QUIC endpoint holds the port (tray restarts);
+  macOS notices are plain modal alerts (no abortModal: it may raise an ObjC exception).
+- CI on PR #2 green: test macOS 300 (+1 ignored) / Windows 294, deny, package macOS/Windows.
