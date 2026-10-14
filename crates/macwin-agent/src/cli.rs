@@ -34,6 +34,11 @@ pub enum Command {
     /// Share the keyboard, mouse and clipboard with the paired machine and
     /// reconnect whenever the connection drops (Ctrl+C to stop).
     Run,
+    /// Start the tray at login (macOS LaunchAgent, Windows Run key).
+    Autostart {
+        #[arg(value_enum, default_value_t = AutostartArg::Status)]
+        action: AutostartArg,
+    },
     /// Read-only checks of this machine.
     #[command(subcommand)]
     Probe(Probe),
@@ -140,6 +145,13 @@ pub struct SpikeInjectArgs {
     /// Required, so the cursor never moves by accident.
     #[arg(long, required = true)]
     pub demo: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AutostartArg {
+    On,
+    Off,
+    Status,
 }
 
 /// Where the peer's screens are.
@@ -356,6 +368,17 @@ mod tests {
             Command::Config(ConfigCmd::Show)
         ));
         assert!(matches!(parse(&["run"]).unwrap().command, Command::Run));
+        for (args, want) in [
+            (&["autostart"][..], AutostartArg::Status),
+            (&["autostart", "on"], AutostartArg::On),
+            (&["autostart", "off"], AutostartArg::Off),
+        ] {
+            match parse(args).unwrap().command {
+                Command::Autostart { action } => assert_eq!(action, want),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(parse(&["autostart", "maybe"]).is_err());
         assert!(matches!(
             parse(&["unpair"]).unwrap().command,
             Command::Unpair

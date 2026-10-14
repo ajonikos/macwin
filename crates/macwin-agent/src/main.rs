@@ -28,6 +28,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Config(ConfigCmd::Show) => commands::config_show(),
         Command::Config(ConfigCmd::Set { key, value }) => commands::config_set(&key, &value),
         Command::Run => commands::run().await,
+        Command::Autostart { action } => commands::autostart(action),
         Command::Probe(Probe::Screens) => commands::probe_screens(),
         Command::Probe(Probe::Permissions { prompt }) => {
             commands::probe_permissions(prompt);

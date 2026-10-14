@@ -2,6 +2,7 @@
 //! Engine and the platform backends, shared by the `macwin` binary and tests.
 #![forbid(unsafe_code)]
 
+pub mod autostart;
 pub mod cli;
 pub mod commands;
 pub mod driver;

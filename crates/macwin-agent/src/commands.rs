@@ -18,7 +18,8 @@ use macwin_net::{Fingerprint, Identity, NetError, Session, config_dir, connect, 
 use macwin_platform::{CaptureSink, ClipboardInfo};
 use tracing::{info, warn};
 
-use crate::cli::{PairArgs, SpikeCaptureArgs, SpikeKvmArgs, SpikeNetArgs};
+use crate::autostart::{self, AutostartState};
+use crate::cli::{AutostartArg, PairArgs, SpikeCaptureArgs, SpikeKvmArgs, SpikeNetArgs};
 use crate::config::{Config, normalize_address, os_name, remember_peer_address, side_name};
 use crate::driver::{
     ClipboardSettings, Connected, SessionConfig, SessionEnd, kvm_hello, spawn_session,
@@ -239,6 +240,40 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
     config.set(key, value)?;
     config.save(&dir)?;
     println!("{key} = {value}");
+    Ok(())
+}
+
+pub fn autostart(action: AutostartArg) -> anyhow::Result<()> {
+    supported_os()?;
+    let a = autostart::for_this_machine()?;
+    match action {
+        AutostartArg::On => {
+            if cfg!(target_os = "macos")
+                && let Ok(exe) = std::env::current_exe()
+                && autostart::app_bundle(&exe).is_none()
+            {
+                eprintln!(
+                    "warning: this macwin is not inside MacWin.app; macOS will ask for its \
+                     permissions separately"
+                );
+            }
+            a.enable()?;
+            println!("macwin starts at login ({})", a.describe());
+        }
+        AutostartArg::Off => {
+            a.disable()?;
+            println!("macwin no longer starts at login");
+        }
+        AutostartArg::Status => match a.state()? {
+            AutostartState::On => println!("on ({})", a.describe()),
+            AutostartState::Off => println!("off"),
+            AutostartState::Other => println!(
+                "on, but for another copy of macwin ({}); `macwin autostart on` switches it to \
+                 this one",
+                a.describe()
+            ),
+        },
+    }
     Ok(())
 }
 

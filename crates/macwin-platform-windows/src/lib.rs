@@ -1,6 +1,7 @@
 //! Windows backend for macwin: low-level keyboard/mouse hooks, SendInput,
-//! per-monitor-v2 DPI screen enumeration, the Win32 clipboard and DPAPI
-//! secret storage. Compiles to an empty library on other operating systems.
+//! per-monitor-v2 DPI screen enumeration, the Win32 clipboard, DPAPI secret
+//! storage and the login `Run` key. Compiles to an empty library on other
+//! operating systems.
 //!
 //! Known limits (by design of Windows):
 //! - windows of elevated (admin) processes neither receive SendInput from a
@@ -15,6 +16,7 @@ mod clipboard;
 mod dpapi;
 mod dpi;
 mod inject;
+pub mod registry;
 mod screens;
 
 pub use capture::WinCapture;
