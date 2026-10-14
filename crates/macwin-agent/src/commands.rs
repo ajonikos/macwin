@@ -450,8 +450,10 @@ fn run_tray_app() -> anyhow::Result<()> {
     let controller = runtime.spawn(controller);
     let quitter = app.clone();
     runtime.spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        quitter.quit();
+        // Without a console (macwin-tray.exe) this never fires; an error must not quit.
+        if tokio::signal::ctrl_c().await.is_ok() {
+            quitter.quit();
+        }
     });
     // On macOS this ends the process once the controller has finished.
     platform::run_tray(app.clone())?;

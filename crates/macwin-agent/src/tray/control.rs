@@ -349,10 +349,12 @@ impl Controller {
     }
 
     async fn stop_sharing(&mut self) {
-        if let Some(r) = self.runner.take() {
+        if let Some(mut r) = self.runner.take() {
             let _ = r.stop.send(true);
-            if tokio::time::timeout(STOP_WAIT, r.task).await.is_err() {
-                warn!("the run loop did not stop in time");
+            if tokio::time::timeout(STOP_WAIT, &mut r.task).await.is_err() {
+                // A stuck run loop must not keep the ports, the capture or the session.
+                warn!("the run loop did not stop in time; aborting it");
+                r.task.abort();
             }
         }
     }
