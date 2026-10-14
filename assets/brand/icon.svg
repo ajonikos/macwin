@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>App icon: one screen shared by two computers, the pointer crossing the seam</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1E293B"/>
+      <stop offset="1" stop-color="#0F172A"/>
+    </linearGradient>
+    <linearGradient id="left" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#4338CA"/>
+    </linearGradient>
+    <linearGradient id="right" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#0D9488"/>
+    </linearGradient>
+    <clipPath id="screen"><rect x="172" y="300" width="680" height="420" rx="56"/></clipPath>
+  </defs>
+  <!-- macOS icon grid: 824 x 824 body in a 1024 canvas. -->
+  <rect x="100" y="100" width="824" height="824" rx="184" fill="url(#bg)"/>
+  <g clip-path="url(#screen)">
+    <rect x="172" y="300" width="340" height="420" fill="url(#left)"/>
+    <rect x="512" y="300" width="340" height="420" fill="url(#right)"/>
+  </g>
+  <rect x="502" y="300" width="20" height="420" fill="#1E293B"/>
+  <path d="M512 742 V 790 M 432 800 H 592" fill="none" stroke="#94A3B8" stroke-width="30" stroke-linecap="round"/>
+  <path transform="translate(470 404)" d="M0 0 V 190 L 48 142 L 84 214 L 109 203 L 73 131 L 134 131 Z" fill="#FFFFFF" stroke="#0F172A" stroke-width="18" stroke-linejoin="round"/>
+</svg>
