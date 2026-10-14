@@ -15,6 +15,12 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+function Send-SettingChange {
+    # Removing a variable that does not exist changes nothing, but .NET still broadcasts
+    # WM_SETTINGCHANGE, so Explorer starts new programs with the new PATH.
+    [Environment]::SetEnvironmentVariable('MACWIN_SETTING_CHANGE', $null, 'User')
+}
+
 Get-Process -Name 'macwin', 'macwin-tray' -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -and $_.Path.StartsWith($Destination, [StringComparison]::OrdinalIgnoreCase) } |
     Stop-Process -Force -PassThru |
@@ -41,12 +47,34 @@ if (Get-NetFirewallRule -Group 'macwin' -ErrorAction SilentlyContinue) {
     }
 }
 
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-$parts = @($userPath -split ';' | Where-Object { $_ -and $_ -ne $Destination })
-[Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
+# Only our entry goes; the rest of the raw value and its type stay (see install.ps1).
+$envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+if ($envKey) {
+    try {
+        $raw = [string]$envKey.GetValue('Path', '',
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $parts = @($raw -split ';' | Where-Object { $_ })
+        $kept = @($parts | Where-Object { $_ -ne $Destination })
+        if ($kept.Count -ne $parts.Count) {
+            if ($kept.Count) {
+                $envKey.SetValue('Path', ($kept -join ';'), $envKey.GetValueKind('Path'))
+            } else {
+                $envKey.DeleteValue('Path')
+            }
+            Send-SettingChange
+        }
+    } finally {
+        $envKey.Close()
+    }
+}
 
-if (Test-Path $Destination) {
-    Remove-Item $Destination -Recurse -Force
+# A folder cannot be removed while it is the current directory, which it is when this
+# script was started from it (for example with "Run with PowerShell").
+$neutral = [IO.Path]::GetTempPath()
+Set-Location -LiteralPath $neutral
+[Environment]::CurrentDirectory = $neutral
+if (Test-Path -LiteralPath $Destination) {
+    Remove-Item -LiteralPath $Destination -Recurse -Force
 }
 if ($Purge) {
     foreach ($dir in (Join-Path $env:APPDATA 'macwin'), (Join-Path $env:LOCALAPPDATA 'macwin')) {
