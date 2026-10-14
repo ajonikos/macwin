@@ -4,16 +4,20 @@
 
 use macwin_core::geometry::ScreenSet;
 use macwin_core::msg::{
-    ButtonMsg, ClipboardImage, ClipboardMsg, ClipboardText, ControlMsg, DatagramMsg, Enter,
-    FileEntry, FilesHeader, Heartbeat, Hello, InputMsg, KeyMsg, Leave, MouseAbs, PairConfirm,
-    PairHello, PairMsg, Ping, Pong, TakeControl, WheelMsg,
+    ButtonMsg, ClipboardImage, ClipboardMsg, ClipboardText, ControlMsg, DatagramMsg,
+    DiscoveryAnswer, DiscoveryMsg, DiscoveryOffer, DiscoveryQuery, DiscoverySeek, Enter, FileEntry,
+    FilesHeader, Heartbeat, Hello, InputMsg, KeyMsg, Leave, MouseAbs, PairConfirm, PairHello,
+    PairMsg, Ping, Pong, TakeControl, WheelMsg,
 };
 use macwin_core::types::{
     GeometryError, Hid, ModifierMask, MouseButton, Os, Point, Rect, RoleKind, ScreenInfo, Side,
     WheelUnit,
 };
 
-use crate::wire::{self, clipboard_frame, control_frame, datagram_frame, input_frame, pair_frame};
+use crate::wire::{
+    self, clipboard_frame, control_frame, datagram_frame, discovery_answer, discovery_frame,
+    discovery_query, input_frame, pair_frame,
+};
 use crate::{
     MAX_CAPABILITIES, MAX_CAPABILITY_LEN, MAX_CLIPBOARD_IMAGE, MAX_CLIPBOARD_TEXT, MAX_FILE_DEPTH,
     MAX_FILE_ENTRIES, MAX_FILE_PATH_LEN, MAX_FILES_TOTAL, MAX_STRING_LEN, PAIR_MAC_LEN, ProtoError,
@@ -583,5 +587,103 @@ pub(crate) fn pair_from_wire(f: wire::PairFrame) -> Result<PairMsg, ProtoError> 
             Ok(PairMsg::Confirm(PairConfirm { mac }))
         }
         pair_frame::Kind::Done(_) => Ok(PairMsg::Done),
+    }
+}
+
+pub(crate) fn discovery_to_wire(m: &DiscoveryMsg) -> wire::DiscoveryFrame {
+    let kind = match m {
+        DiscoveryMsg::Query(q) => discovery_frame::Kind::Query(wire::DiscoveryQuery {
+            protocol_version: q.protocol_version,
+            nonce: q.nonce.to_vec(),
+            seek: Some(match &q.seek {
+                DiscoverySeek::Pairing => discovery_query::Seek::Pairing(wire::SeekPairing {}),
+                DiscoverySeek::Peer { target, sender } => {
+                    discovery_query::Seek::Peer(wire::SeekPeer {
+                        target: target.to_vec(),
+                        sender: sender.to_vec(),
+                    })
+                }
+            }),
+        }),
+        DiscoveryMsg::Answer(a) => discovery_frame::Kind::Answer(wire::DiscoveryAnswer {
+            protocol_version: a.protocol_version,
+            nonce: a.nonce.to_vec(),
+            port: u32::from(a.port),
+            offer: Some(match &a.offer {
+                DiscoveryOffer::Pairing {
+                    os,
+                    device_name,
+                    fingerprint,
+                } => discovery_answer::Offer::Pairing(wire::OfferPairing {
+                    os: os_to_wire(*os) as i32,
+                    device_name: device_name.clone(),
+                    fingerprint: fingerprint.to_vec(),
+                }),
+                DiscoveryOffer::Peer { proof } => discovery_answer::Offer::Peer(wire::OfferPeer {
+                    proof: proof.to_vec(),
+                }),
+            }),
+        }),
+    };
+    wire::DiscoveryFrame { kind: Some(kind) }
+}
+
+fn fixed_bytes<const N: usize>(
+    b: &[u8],
+    field: &'static str,
+    reason: &'static str,
+) -> Result<[u8; N], ProtoError> {
+    b.try_into()
+        .map_err(|_| ProtoError::InvalidValue { field, reason })
+}
+
+pub(crate) fn discovery_from_wire(f: wire::DiscoveryFrame) -> Result<DiscoveryMsg, ProtoError> {
+    match f.kind.ok_or(ProtoError::UnknownKind("discovery frame"))? {
+        discovery_frame::Kind::Query(q) => {
+            let nonce = fixed_bytes(&q.nonce, "discovery.nonce", "nonce must be 16 bytes")?;
+            let seek = match q.seek.ok_or(ProtoError::UnknownKind("discovery query"))? {
+                discovery_query::Seek::Pairing(_) => DiscoverySeek::Pairing,
+                discovery_query::Seek::Peer(p) => DiscoverySeek::Peer {
+                    target: fixed_bytes(&p.target, "discovery.target", "tag must be 32 bytes")?,
+                    sender: fixed_bytes(&p.sender, "discovery.sender", "tag must be 32 bytes")?,
+                },
+            };
+            Ok(DiscoveryMsg::Query(DiscoveryQuery {
+                protocol_version: q.protocol_version,
+                nonce,
+                seek,
+            }))
+        }
+        discovery_frame::Kind::Answer(a) => {
+            let nonce = fixed_bytes(&a.nonce, "discovery.nonce", "nonce must be 16 bytes")?;
+            let port =
+                u16::try_from(a.port)
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or(ProtoError::InvalidValue {
+                        field: "discovery.port",
+                        reason: "port must be 1..=65535",
+                    })?;
+            let offer = match a.offer.ok_or(ProtoError::UnknownKind("discovery answer"))? {
+                discovery_answer::Offer::Pairing(p) => DiscoveryOffer::Pairing {
+                    os: os_from_wire(p.os, "discovery.os")?,
+                    device_name: string_from_wire(p.device_name, "discovery.device_name")?,
+                    fingerprint: fixed_bytes(
+                        &p.fingerprint,
+                        "discovery.fingerprint",
+                        "fingerprint must be 32 bytes",
+                    )?,
+                },
+                discovery_answer::Offer::Peer(p) => DiscoveryOffer::Peer {
+                    proof: fixed_bytes(&p.proof, "discovery.proof", "tag must be 32 bytes")?,
+                },
+            };
+            Ok(DiscoveryMsg::Answer(DiscoveryAnswer {
+                protocol_version: a.protocol_version,
+                nonce,
+                port,
+                offer,
+            }))
+        }
     }
 }

@@ -283,3 +283,60 @@ pub struct PairHello {
 pub struct PairConfirm {
     pub mac: [u8; 32],
 }
+
+/// LAN discovery datagrams (UDP broadcast, see `macwin-net`): finding a
+/// machine that waits for pairing, or the paired peer after its address
+/// changed. Answers are only hints: pairing is authenticated by the code
+/// and sessions by certificate pinning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryMsg {
+    Query(DiscoveryQuery),
+    Answer(DiscoveryAnswer),
+}
+
+/// A broadcast question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryQuery {
+    /// `major << 16 | minor`.
+    pub protocol_version: u32,
+    /// Random per query; answers echo it.
+    pub nonce: [u8; 16],
+    pub seek: DiscoverySeek,
+}
+
+/// What a query looks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoverySeek {
+    /// Any machine waiting for pairing.
+    Pairing,
+    /// A paired machine, named by tags over the nonce and the fingerprints
+    /// of the wanted (`target`) and the asking (`sender`) machine, so the
+    /// fingerprints themselves are never broadcast.
+    Peer { target: [u8; 32], sender: [u8; 32] },
+}
+
+/// A unicast reply to a query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryAnswer {
+    pub protocol_version: u32,
+    /// The query's nonce.
+    pub nonce: [u8; 16],
+    /// The port the machine accepts QUIC connections on; its address is the
+    /// answer's source address.
+    pub port: u16,
+    pub offer: DiscoveryOffer,
+}
+
+/// What an answering machine offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryOffer {
+    /// It waits for pairing.
+    Pairing {
+        os: Os,
+        device_name: String,
+        fingerprint: [u8; 32],
+    },
+    /// It runs sessions for the asking machine; `proof` is a tag over the
+    /// nonce and the answering machine's fingerprint.
+    Peer { proof: [u8; 32] },
+}
