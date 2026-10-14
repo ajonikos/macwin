@@ -14,6 +14,8 @@ use macwin_core::types::Os;
 pub mod clipboard;
 pub mod config;
 pub mod identity_store;
+pub mod lan;
+pub mod pairing;
 pub mod runner;
 pub mod sharing;
 pub mod transfer;

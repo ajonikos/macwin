@@ -11,8 +11,8 @@ use macwin_net::Fingerprint;
     name = "macwin",
     version,
     about = "Share one keyboard, mouse and clipboard between a Mac and a Windows PC on one LAN",
-    after_help = "Getting started: run `macwin pair` on one machine; it shows a code and the command\n\
-                  to type on the other machine. Then run `macwin run` on both."
+    after_help = "Getting started: run `macwin pair` on one machine; it shows a code. On the other\n\
+                  machine run `macwin pair --code CODE`. Then run `macwin run` on both."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -45,11 +45,14 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct PairArgs {
     /// The other machine's address (HOST or HOST:PORT), as printed by its
-    /// `macwin pair`. Without it, this machine waits and shows a code.
+    /// `macwin pair`. Without an address and a code, this machine waits and
+    /// shows a code.
     #[arg(value_name = "HOST[:PORT]")]
     pub address: Option<String>,
-    /// The code shown on the other machine (asked for when omitted).
-    #[arg(long, requires = "address")]
+    /// The code shown on the other machine. Without an address, the machine
+    /// that waits for pairing is looked up on the local network; with one,
+    /// the code is asked for when omitted.
+    #[arg(long, conflicts_with = "listen")]
     pub code: Option<String>,
     /// Which side of this machine the other machine's screens are on.
     #[arg(long, value_enum)]
@@ -64,9 +67,10 @@ pub enum ConfigCmd {
     /// Print the configuration.
     Show,
     /// Change one setting. Keys: side (left|right|none), address
-    /// (HOST[:PORT]|none), listen (ADDR:PORT), remap (on|off), clipboard
-    /// (on|off), clipboard-max-kb (1-16384), clipboard-images (on|off),
-    /// clipboard-files (on|off), clipboard-files-max-mb (1-65536).
+    /// (HOST[:PORT]|none), listen (ADDR:PORT), remap (on|off), discovery
+    /// (on|off), discovery-port (1-65535), clipboard (on|off),
+    /// clipboard-max-kb (1-16384), clipboard-images (on|off), clipboard-files
+    /// (on|off), clipboard-files-max-mb (1-65536).
     Set { key: String, value: String },
 }
 
@@ -331,9 +335,13 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+        match parse(&["pair", "--code", "123456"]).unwrap().command {
+            Command::Pair(a) => assert!(a.address.is_none() && a.code.is_some()),
+            other => panic!("unexpected {other:?}"),
+        }
         assert!(
-            parse(&["pair", "--code", "123456"]).is_err(),
-            "a code needs an address"
+            parse(&["pair", "--code", "123456", "--listen", "0.0.0.0:1"]).is_err(),
+            "find or wait, not both"
         );
         assert!(
             parse(&["pair", "pc", "--listen", "0.0.0.0:1"]).is_err(),

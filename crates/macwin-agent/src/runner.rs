@@ -2,16 +2,23 @@
 //! after every disconnect. The machine that knows the peer's address dials
 //! it; the other one listens. Only the emergency chord or a stop request
 //! (Ctrl+C) ends the loop.
+//!
+//! With LAN discovery, the listening machine answers its peer's queries and
+//! a dialing machine whose dial failed asks where the peer is now, so a
+//! changed IP address heals by itself.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use macwin_core::engine::TransportRole;
+use macwin_core::msg::Hello;
 use macwin_core::types::RoleKind;
+use macwin_net::discovery::{Offer, Responder, find_peer};
 use macwin_net::{Fingerprint, Identity, NetError, Session, connect, listen};
 use macwin_platform::PlatformError;
 use tokio::sync::watch;
+use tracing::{debug, info, warn};
 
 use crate::driver::{Backends, Connected, SessionConfig, SessionEnd, kvm_hello, spawn_session};
 
@@ -34,6 +41,17 @@ pub enum Mode {
     Dial(String),
 }
 
+/// LAN discovery of the run loop.
+#[derive(Debug, Clone)]
+pub struct RunDiscovery {
+    /// Where a listening machine answers its peer's queries.
+    pub responder: SocketAddr,
+    /// Where a dialing machine asks after a failed dial.
+    pub targets: Vec<SocketAddr>,
+    /// How long it waits for the answer.
+    pub wait: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     pub session: SessionConfig,
@@ -47,6 +65,8 @@ pub struct RunOptions {
     pub retry_max: Duration,
     /// Bound on one dial attempt.
     pub connect_timeout: Duration,
+    /// `None`: no LAN discovery.
+    pub discovery: Option<RunDiscovery>,
 }
 
 /// Progress reports for the user.
@@ -58,6 +78,9 @@ pub enum RunEvent {
         name: String,
         remote: SocketAddr,
     },
+    /// The peer answered a discovery query from a new address and the
+    /// session there is up; later dials use that address.
+    PeerFound(SocketAddr),
     Role(RoleKind),
     Ended(SessionEnd),
     /// A connection attempt failed; the next one starts after `after`.
@@ -97,6 +120,83 @@ pub async fn resolve(target: &str) -> anyhow::Result<SocketAddr> {
         .with_context(|| format!("{target} has no address"))
 }
 
+/// One bounded dial attempt.
+async fn dial(
+    remote: SocketAddr,
+    opts: &RunOptions,
+    id: &Identity,
+    hello: &Hello,
+) -> anyhow::Result<Session> {
+    tokio::time::timeout(
+        opts.connect_timeout,
+        connect(bind_for(remote), remote, id, opts.peer, hello),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("no answer from {remote}"))?
+    .with_context(|| format!("cannot connect to {remote}"))
+}
+
+/// Dials `target`; when that fails, asks the LAN where the peer is now and
+/// dials the address it answers from. Returns the session and that new
+/// address, if it was used.
+async fn dial_or_find(
+    target: &str,
+    opts: &RunOptions,
+    id: &Identity,
+    hello: &Hello,
+) -> anyhow::Result<(Session, Option<SocketAddr>)> {
+    let (error, tried) = match resolve(target).await {
+        Ok(remote) => match dial(remote, opts, id, hello).await {
+            Ok(s) => return Ok((s, None)),
+            Err(e) => (e, Some(remote)),
+        },
+        Err(e) => (e, None),
+    };
+    let Some(d) = &opts.discovery else {
+        return Err(error);
+    };
+    let found = match find_peer(&d.targets, id.fingerprint(), opts.peer, d.wait).await {
+        Ok(Some(found)) if Some(found) != tried => found,
+        Ok(_) => return Err(error),
+        Err(e) => {
+            debug!(error = %e, "LAN discovery failed");
+            return Err(error);
+        }
+    };
+    info!(%found, "the other machine answered from a new address");
+    match dial(found, opts, id, hello).await {
+        Ok(s) => Ok((s, Some(found))),
+        Err(e) => Err(error.context(format!("{e:#} (found it at {found})"))),
+    }
+}
+
+/// Answers the peer's discovery queries while `listener` listens; `None`
+/// (after a warning) when its port is unavailable.
+async fn peer_responder(
+    d: &RunDiscovery,
+    listener: &macwin_net::Listener,
+    id: &Identity,
+    peer: Fingerprint,
+) -> anyhow::Result<Option<Responder>> {
+    let offer = Offer::Peer {
+        port: listener.local_addr()?.port(),
+        own: id.fingerprint(),
+        peer,
+    };
+    Ok(match Responder::bind(d.responder, offer).await {
+        Ok(r) => Some(r),
+        Err(e) => {
+            warn!(
+                addr = %d.responder,
+                error = %e,
+                "LAN discovery is unavailable: the other machine cannot find this one after an \
+                 address change"
+            );
+            None
+        }
+    })
+}
+
 /// Resolves when `stop` is raised (or its sender is gone).
 async fn stopped(stop: &mut watch::Receiver<bool>) {
     let _ = stop.wait_for(|s| *s).await;
@@ -129,6 +229,14 @@ pub async fn run(
         }
         Mode::Dial(_) => None,
     };
+    let _responder = match (&listener, &opts.discovery) {
+        (Some(l), Some(d)) => peer_responder(d, l, &id, opts.peer).await?,
+        _ => None,
+    };
+    let mut target = match &opts.mode {
+        Mode::Dial(t) => t.clone(),
+        Mode::Listen(_) => String::new(),
+    };
     let retry_min = opts.retry_min.min(opts.retry_max);
     let mut backoff = retry_min;
     loop {
@@ -141,39 +249,30 @@ pub async fn run(
             .screens()
             .context("cannot read the screens")?;
         let hello = kvm_hello(&opts.session, screens);
-        let attempt: Result<(Session, TransportRole), anyhow::Error> = match (&opts.mode, &listener)
-        {
-            (Mode::Listen(_), Some(l)) => tokio::select! {
-                r = l.accept(&hello) => match r {
-                    Ok(s) => Ok((s, TransportRole::Listener)),
-                    Err(NetError::EndpointClosed) => bail!("the listener closed"),
-                    Err(e) => Err(e.into()),
-                },
-                () = stopped(&mut stop) => return Ok(RunExit::Stopped),
-            },
-            (Mode::Dial(target), _) => {
-                if backoff == retry_min {
-                    on_event(RunEvent::Dialing(target.clone()));
-                }
-                let dial = async {
-                    let remote = resolve(target).await?;
-                    let s = tokio::time::timeout(
-                        opts.connect_timeout,
-                        connect(bind_for(remote), remote, &id, opts.peer, &hello),
-                    )
-                    .await
-                    .map_err(|_| anyhow::anyhow!("no answer from {remote}"))?
-                    .with_context(|| format!("cannot connect to {remote}"))?;
-                    anyhow::Ok((s, TransportRole::Dialer))
-                };
-                tokio::select! {
-                    r = dial => r,
+        let attempt: anyhow::Result<(Session, TransportRole, Option<SocketAddr>)> =
+            match (&opts.mode, &listener) {
+                (Mode::Listen(_), Some(l)) => tokio::select! {
+                    r = l.accept(&hello) => match r {
+                        Ok(s) => Ok((s, TransportRole::Listener, None)),
+                        Err(NetError::EndpointClosed) => bail!("the listener closed"),
+                        Err(e) => Err(e.into()),
+                    },
                     () = stopped(&mut stop) => return Ok(RunExit::Stopped),
+                },
+                (Mode::Dial(_), _) => {
+                    if backoff == retry_min {
+                        on_event(RunEvent::Dialing(target.clone()));
+                    }
+                    tokio::select! {
+                        r = dial_or_find(&target, &opts, &id, &hello) => {
+                            r.map(|(s, found)| (s, TransportRole::Dialer, found))
+                        }
+                        () = stopped(&mut stop) => return Ok(RunExit::Stopped),
+                    }
                 }
-            }
-            (Mode::Listen(_), None) => unreachable!("listen mode always has a listener"),
-        };
-        let (session, role) = match attempt {
+                (Mode::Listen(_), None) => unreachable!("listen mode always has a listener"),
+            };
+        let (session, role, found) = match attempt {
             Ok(x) => x,
             Err(e) => {
                 let error = format!("{e:#}");
@@ -198,6 +297,10 @@ pub async fn run(
             }
         };
         backoff = retry_min;
+        if let Some(addr) = found {
+            target = addr.to_string();
+            on_event(RunEvent::PeerFound(addr));
+        }
         on_event(RunEvent::Connected {
             name: session.peer.device_name.clone(),
             remote: session.remote,

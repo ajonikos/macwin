@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use macwin_agent::driver::{Backends, SessionConfig, SessionEnd};
-use macwin_agent::runner::{Mode, RunEvent, RunExit, RunOptions, run};
+use macwin_agent::runner::{Mode, RunDiscovery, RunEvent, RunExit, RunOptions, run};
 use macwin_core::engine::Timings;
 use macwin_core::types::{CaptureFault, Os, Rect, ScreenInfo, Side};
 use macwin_net::{Fingerprint, Identity};
@@ -47,6 +47,16 @@ struct Agent {
 }
 
 fn start(cfg: SessionConfig, mode: Mode, id: Identity, peer: Fingerprint) -> Agent {
+    start_with(cfg, mode, id, peer, None)
+}
+
+fn start_with(
+    cfg: SessionConfig,
+    mode: Mode,
+    id: Identity,
+    peer: Fingerprint,
+    discovery: Option<RunDiscovery>,
+) -> Agent {
     let captures = Arc::new(Mutex::new(Vec::new()));
     let made = captures.clone();
     let make = move || -> Result<Backends, PlatformError> {
@@ -73,6 +83,7 @@ fn start(cfg: SessionConfig, mode: Mode, id: Identity, peer: Fingerprint) -> Age
         retry_min: Duration::from_millis(50),
         retry_max: Duration::from_millis(200),
         connect_timeout: Duration::from_millis(300),
+        discovery,
     };
     let task = tokio::spawn(run(
         opts,
@@ -126,12 +137,22 @@ fn connected(e: &RunEvent) -> bool {
 /// Starts a listening agent on `addr`, retrying while the port is still
 /// held by a previous endpoint that is shutting down.
 async fn listening(addr: SocketAddr, id: &Identity, peer: Fingerprint) -> Agent {
+    listening_with(addr, id, peer, None).await
+}
+
+async fn listening_with(
+    addr: SocketAddr,
+    id: &Identity,
+    peer: Fingerprint,
+    discovery: Option<RunDiscovery>,
+) -> Agent {
     for _ in 0..100 {
-        let mut agent = start(
+        let mut agent = start_with(
             session(Os::Windows, "pc", Side::Left),
             Mode::Listen(addr),
             id.clone(),
             peer,
+            discovery.clone(),
         );
         match tokio::time::timeout(T, agent.events.recv()).await {
             Ok(Some(RunEvent::Listening(_))) => return agent,
@@ -209,6 +230,43 @@ async fn a_stop_while_dialing_exits_promptly() {
     );
     mac.expect("a failed dial", |e| matches!(e, RunEvent::Retrying { .. }))
         .await;
+    mac.stop.send(true).unwrap();
+    assert_eq!(mac.finish().await, RunExit::Stopped);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dialer_finds_its_peer_at_a_new_address() {
+    let mac_id = Identity::generate().unwrap();
+    let pc_id = Identity::generate().unwrap();
+    let local = |port: u16| -> SocketAddr { format!("127.0.0.1:{port}").parse().unwrap() };
+    // The Mac remembers an address nobody listens on any more.
+    let (old, new, answers) = (local(free_port()), local(free_port()), local(free_port()));
+    let discovery = RunDiscovery {
+        responder: answers,
+        targets: vec![answers],
+        wait: Duration::from_millis(500),
+    };
+    let mut pc = listening_with(new, &pc_id, mac_id.fingerprint(), Some(discovery.clone())).await;
+    let mut mac = start_with(
+        session(Os::MacOs, "mac", Side::Right),
+        Mode::Dial(old.to_string()),
+        mac_id,
+        pc_id.fingerprint(),
+        Some(discovery),
+    );
+    let e = mac
+        .expect("found", |e| matches!(e, RunEvent::PeerFound(_)))
+        .await;
+    assert_eq!(e, RunEvent::PeerFound(new));
+    mac.expect("connected", connected).await;
+    pc.expect("connected", connected).await;
+    // After the session ends the Mac redials the new address directly.
+    pc.stop.send(true).unwrap();
+    assert_eq!(pc.finish().await, RunExit::Stopped);
+    let e = mac
+        .expect("redialing", |e| matches!(e, RunEvent::Dialing(_)))
+        .await;
+    assert_eq!(e, RunEvent::Dialing(new.to_string()));
     mac.stop.send(true).unwrap();
     assert_eq!(mac.finish().await, RunExit::Stopped);
 }
