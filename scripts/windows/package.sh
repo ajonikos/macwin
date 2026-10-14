@@ -33,9 +33,13 @@ cp "target/$TARGET/release/macwin.exe" "target/$TARGET/release/macwin-tray.exe" 
     scripts/windows/install.cmd scripts/windows/install.ps1 scripts/windows/uninstall.ps1 \
     scripts/windows/README.txt THIRD_PARTY_NOTICES "$STAGE/$NAME/"
 rm -f "$ZIP"
+cd "$STAGE"
 if command -v zip >/dev/null; then
-    (cd "$STAGE" && zip -qr "$ZIP" "$NAME")
+    zip -qr "$ZIP" "$NAME"
+elif command -v python3 >/dev/null; then
+    python3 -m zipfile -c "$ZIP" "$NAME"
 else
-    (cd "$STAGE" && python3 -m zipfile -c "$ZIP" "$NAME")
+    # Windows: Git Bash has no zip; its Python is called python.
+    python -m zipfile -c "$ZIP" "$NAME"
 fi
 echo "built $ZIP"
