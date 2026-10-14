@@ -1,0 +1,27 @@
+{
+  "id": "FEAT-004",
+  "type": "feat",
+  "description": "macwin-proto (strict protobuf codec with hand-written prost derives, stream framing, version negotiation) and macwin-platform (backend traits, PlatformError, UnsupportedPlatform, and the `testing` fakes used by the agent integration tests). Plan items 11-12 with decisions B2 and B4. Depends on FEAT-002 (domain types/messages); independent of FEAT-003 (Engine), and proto and platform are independent of each other.",
+  "status": "pending",
+  "steps": [
+    "Plan item 11: crates/macwin-proto/src/wire.rs with the exact prost schema from plan B2 (ControlFrame/InputFrame/DatagramFrame oneofs and field numbers, Hello, Screen, Point, Heartbeat, Ping, Pong, Enter, Leave, TakeControl, Key, Button, Wheel, ModifierSync, MouseAbs, enums Os/Side/Role/MouseButton/WheelUnit with 0 = UNSPECIFIED). Never add #[derive(Debug)] to prost Message/Oneof types.",
+    "Plan item 11 (cont.): crates/macwin-proto/src/convert.rs (domain -> wire infallible; wire -> domain with every B2 validation rule: unknown/missing oneof, missing submessage, enum 0/unknown, Hid page 0x07/0x0C and <= 0x00FF_FFFF, mask <= 0xFF, 1..=16 screens with unique ids built through macwin_core Rect::new, npl finite in [0.25, 8.0], string and capability limits), crates/macwin-proto/src/frame.rs (encode(body) -> Bytes with varint length prefix; FrameBuffer push/next_frame, reject length > MAX_FRAME_LEN before buffering the body), crates/macwin-proto/src/lib.rs (PROTOCOL_VERSION = 0x0001_0000, MAX_FRAME_LEN = 65536, version_major, check_version, encode_/decode_ control/input/datagram, ProtoError).",
+    "Plan item 11 tests: crates/macwin-proto/tests/golden.rs asserting InputFrame{Key{hid: 0x070004, down: true}} encodes to 22 06 08 84 80 1c 10 01 via encode_input(&InputMsg::Key(..)) and decodes back; unit tests for each rejection rule and check_version cases; FrameBuffer split/multi-frame/oversize tests; proptests: domain round trip for all three families (strategies generating only valid values) and arbitrary bytes never panic in the three decoders and FrameBuffer.",
+    "Plan item 12: crates/macwin-platform/src/lib.rs with PlatformError, CaptureSink, CaptureControl, InputCapture, InputInjector, ScreenSource and UnsupportedPlatform exactly per plan B4 (doc comments state the non-blocking/re-entrancy contract); crates/macwin-platform/src/testing.rs behind feature `testing` with FakeCapture/FakeCaptureHandle (emit calls the sink with no internal lock held; records commands, grabbed(), lease(), stopped()), FakeInjector/FakeInjectorHandle (commands, pressed_keys, pressed_buttons, last_pos, unmatched_ups, clear), FakeScreens. Unit tests: re-entrant command() from inside the sink during emit, pressed-state bookkeeping, UnsupportedPlatform returns Unsupported."
+  ],
+  "acceptance_criteria": [
+    "`RUSTUP_TOOLCHAIN=stable cargo test -p macwin-proto` passes including the golden bytes test and both proptests",
+    "Decoding rejects every invalid input listed in plan B2 with the matching ProtoError variant; check_version rejects a different major and 0, accepts a different minor",
+    "`RUSTUP_TOOLCHAIN=stable cargo test -p macwin-platform --all-features` passes and `cargo build -p macwin-platform` builds without the testing feature",
+    "No protoc, prost-build or protox in the dependency graph; both crates keep #![forbid(unsafe_code)]; clippy -D warnings clean on host and x86_64-pc-windows-gnu"
+  ],
+  "verification": [
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo test -p macwin-proto",
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo test -p macwin-platform --all-features && RUSTUP_TOOLCHAIN=stable cargo build -p macwin-platform",
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo clippy -p macwin-proto -p macwin-platform --all-targets --all-features -- -D warnings",
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo clippy -p macwin-proto -p macwin-platform --all-targets --all-features --target x86_64-pc-windows-gnu -- -D warnings",
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo fmt --all --check"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

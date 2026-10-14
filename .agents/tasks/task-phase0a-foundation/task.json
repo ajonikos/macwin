@@ -1,0 +1,7 @@
+{
+  "task_id": "task-phase0a-foundation",
+  "task_description": "macwin Phase 0a: build the OS-independent, Mac-verifiable foundation of a Rust software KVM (macOS <-> Windows, one LAN): Cargo workspace + tooling (toolchain pin, cargo config, deny.toml, THIRD_PARTY_NOTICES), keymap-gen + checked-in HID keymap, macwin-core (geometry, keymap, remap, key tracking, heartbeat, emergency chord, Engine state machine, OS helper math) with unit + property tests, macwin-proto (prost codec + version check), macwin-platform (traits + fakes), macwin-net (QUIC/quinn + rustls ring, mutual TLS with SHA-256 pinning, control/input streams + datagrams), library session wiring with 127.0.0.1 integration tests on fakes, the `macwin` CLI (`identity`, `spike net` latency), CI and README. Full plan: /Users/kulacidmyt/Documents/macwin/.agents/tasks/phase0a-plan.md.",
+  "status": "pending",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004", "FEAT-005", "FEAT-006"],
+  "blocked_reason": null
+}

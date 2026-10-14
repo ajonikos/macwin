@@ -1,0 +1,27 @@
+{
+  "id": "FEAT-003",
+  "type": "feat",
+  "description": "macwin-core Engine: the controller state machine from design.md §5.9 (Local <-> Remote, epochs with dialer-odd/listener-even parity, Controlling/Controlled roles, TakeControl ownership switch, takeover by local input, pre-grab and held_from_remote key semantics, target injection rules, ModifierSync, latest-wins MouseAbs, heartbeat cadence/timeout/reconciliation, grab lease renewal, capture-fault handling, disconnect and shutdown releasing everything) with the 18 scenario tests and the random-interleaving property test. Plan item 10. Depends on FEAT-002.",
+  "status": "pending",
+  "steps": [
+    "Create crates/macwin-core/src/engine/mod.rs with the public API exactly as design §5.9 (EngineConfig {local_os, local_screens, peer_side, remap, timings: Timings}, TransportRole {Dialer, Listener}, PeerInfo, LocalOutcome {deliver, actions}, Action {SendControl, SendInput, SendDatagram, Inject, Capture, RenewLease, Close}, CloseReason {HeartbeatTimeout, ProtocolViolation(&'static str), Shutdown, Internal(&'static str)}, Engine::{new, set_local_screens, on_connected, on_disconnected, on_local_event, on_control, on_input, on_datagram, on_tick, on_capture_fault, shutdown, role}) and the constants TICK, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, GRAB_LEASE, TAKEOVER_THRESHOLD, TAKEOVER_WINDOW (re-export EDGE_REENTRY_INSET from layout).",
+    "Create crates/macwin-core/src/engine/session.rs holding the per-connection Session (PeerInfo, Layout, Remap, parity, epoch_max, Role {Idle, Controlling{epoch, v, exit, npl_src, pre_grab, fwd_buttons}, Controlled{epoch, injected_keys, injected_buttons, last_pos, takeover_accum, last_phys_move}}, HeartbeatMonitor, outgoing datagram seq, target last_seq) and LocalInput (physical keys, buttons, last pos, held_from_remote). Implement every row of the §5.9 transition table, the local-event rules (repeat detection for Windows-style repeated downs, swallow rules, pre_grab up delivered AND forwarded), the target injection rules (repeat only if held, up only if held, Button -> MoveTo then button, ModifierSync release-then-press, clamp all peer positions), next_epoch parity, epoch_max updated only from Enter on the input stream, wrong-parity or epoch-0 Enter -> Close(ProtocolViolation), heartbeat reconciliation, `held_from_remote = physical - pre_grab` whenever Controlling ends, on_received for every valid peer frame, INFO logs for role transitions with no key identities.",
+    "Create crates/macwin-core/src/engine/tests.rs (`#[cfg(test)] mod tests;`) with the 18 scenario tests listed in design §5.9, each feeding a scripted sequence with synthetic Instants and asserting the exact Vec<Action>. Use shared builders (mac_1440x900(), win_1920x1080(npl), engine pairs) to keep tests short.",
+    "Add the proptest in engine/tests.rs: random interleavings of local CapturedEvents, peer Control/Input/Datagram messages (valid and stale epochs), ticks with random time advances (including > HEARTBEAT_TIMEOUT gaps), capture faults, disconnect/reconnect and shutdown, on both TransportRoles. Check invariants (a)-(e) from §5.9 plus: after every Leave, on_disconnected, heartbeat timeout and shutdown, the Engine's injected keys/buttons (downs minus ups emitted as Inject) are zero per key and per button; while Idle no Key/Button/Wheel/MouseAbs is sent. Keep the default 256 cases and runtime under 60 s."
+  ],
+  "acceptance_criteria": [
+    "`RUSTUP_TOOLCHAIN=stable cargo test -p macwin-core engine` passes: all 18 design §5.9 scenarios and the property test",
+    "Property test proves no key or button stays injected after Leave, disconnect, heartbeat timeout or shutdown for random sequences",
+    "Epochs emitted by a Dialer engine are odd and strictly increasing; by a Listener even and strictly increasing",
+    "Engine uses no clocks, threads or I/O (time only via Instant arguments); macwin-core still has #![forbid(unsafe_code)]",
+    "clippy -D warnings clean for macwin-core on host and x86_64-pc-windows-gnu"
+  ],
+  "verification": [
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo test -p macwin-core",
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo clippy -p macwin-core --all-targets -- -D warnings",
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo clippy -p macwin-core --all-targets --target x86_64-pc-windows-gnu -- -D warnings",
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo fmt --all --check"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

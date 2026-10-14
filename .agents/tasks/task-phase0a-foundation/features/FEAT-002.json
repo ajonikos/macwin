@@ -1,0 +1,29 @@
+{
+  "id": "FEAT-002",
+  "type": "feat",
+  "description": "macwin-core domain modules except the Engine: full vocabulary types (design.md §5.1 + Rect::new/GeometryError from plan B3), domain messages and capability consts (§5.2), geometry/edge mapping (§5.3), modifier remap (§5.5), pressed-state tracking with release_all ordering (§5.6), heartbeat monitor (§5.7), emergency chord detector (§5.8, Esc chord per design with a NOTE about the brief's Q chord) and pure OS helper math (§5.10). Plan items 7-9. Depends on FEAT-001 (types.rs Hid + keymap).",
+  "status": "pending",
+  "steps": [
+    "Plan item 7: extend crates/macwin-core/src/types.rs with ModifierMask, MouseButton, WheelUnit, Os, Side (opposite()), RoleKind, Point, PointF, Rect (private fields, Rect::new(x,y,w,h) -> Result<Rect, GeometryError> with w,h in 1..=65536 and |x|,|y| <= 1<<20, accessors left/top/right/bottom/width/height, right/bottom exclusive), ScreenInfo, CapturedEvent, GrabCommand, CaptureFault, InjectCommand, plus Timings (fields tick, heartbeat_interval, heartbeat_timeout, grab_lease, takeover_threshold: f64, takeover_window; Default = 50ms/250ms/1500ms/2000ms/8.0/500ms). Add crates/macwin-core/src/msg.rs exactly per §5.2 (ControlMsg, InputMsg, DatagramMsg, Hello, Heartbeat, Ping, Pong, Enter, Leave, TakeControl, KeyMsg, ButtonMsg, WheelMsg, MouseAbs, CAP_INPUT_CAPTURE/CAP_INPUT_INJECT/CAP_SPIKE_NET).",
+    "Plan item 7 (cont.): implement crates/macwin-core/src/geometry.rs (screen-set validation: non-empty, <= 16, unique ids; bounding box; clamp with closed pixel boxes, Euclidean nearest, ties to lowest index, floor for floats; t(); free-edge test; face()) and crates/macwin-core/src/layout.rs (Layout built from local + peer screens and peer_side: entry point, virtual cursor step -> Moved(PointF)/Exited with the mid-drag exception, speed normalization d_t = d_s / npl_src * npl_tgt, leave mapping, inset(exit), EDGE_REENTRY_INSET = 2). Unit tests plus the six §5.3 proptest properties over random 1-4 screen grid arrangements for both sides.",
+    "Plan item 8: crates/macwin-core/src/remap.rs (Remap::new(src, dst, enabled); swaps 0xE0<->0xE3 and 0xE4<->0xE7 when enabled && src != dst; map_hid and map_mask), crates/macwin-core/src/keys.rs (KeySet over BTreeSet<Hid>, ButtonSet u8 mask, release_all(at) -> Vec<InjectCommand>: button ups at `at`, then non-modifier key ups, then modifier ups; empties the sets; idempotent), crates/macwin-core/src/heartbeat.rs (HeartbeatMonitor new/due/on_sent/on_received/timed_out with now - last_rx >= timeout), crates/macwin-core/src/safety.rs (EmergencyDetector::on_key(hid, down, repeat, snapshot) -> bool, Ctrl+Alt+Shift (either side) + non-repeat Escape down, snapshot replaces tracked state, one fire per press, allocation-free; add `// NOTE: brief specifies Ctrl+Alt/Option+Shift+Q; design.md §5.8 specifies Esc — following the design, pending review.`). Tests as listed in design §5.5-§5.8 incl. the remap involution proptest.",
+    "Plan item 9: crates/macwin-core/src/os/{mod.rs,macos.rs,windows.rs} per §5.10: INJECT_TAG = 0x6D61_6377_696E_0001; windows::{scan_to_hid (None for scan 0 / unknown; drops 0xE02A and 0x21D), WinKey {Scancode{sc, extended}, Vk{vk, extended}}, key_injection (Pause -> Vk{0x13,false}, NumLock -> Vk{0x90,true}, else scancode from keymap), normalize_absolute (ceil formula, clamp 0..=65535), XBUTTON1 = 1 / XBUTTON2 = 2}; macos::{device-dependent and device-independent flag consts, FlagsChange {Down, Up, Tap}, flags_changed(keycode, flags), flags_for(mask), mask_from_flags, scroll_from_fixed(axis1, axis2), WheelAccumulator, ClickCounter::on_down(button, pos, now, interval) -> i64 (4-point radius)}. All pure, compiled on every OS. Tests per §5.10 including the normalize_absolute round trip for widths 1..=20000 under the floor model.",
+    "Wire every module into crates/macwin-core/src/lib.rs with pub re-exports of the vocabulary types; run fmt, clippy (host and x86_64-pc-windows-gnu) and the core tests."
+  ],
+  "acceptance_criteria": [
+    "`RUSTUP_TOOLCHAIN=stable cargo test -p macwin-core` passes, including all proptest properties from design §5.3 and the remap involution property",
+    "Rect::new rejects zero/negative sizes and out-of-range coordinates; clamp is idempotent and always on screen (proptest)",
+    "release_all emits button ups, then non-modifier key ups, then modifier ups, and a second call returns an empty Vec",
+    "EmergencyDetector fires exactly once per Ctrl+Alt+Shift+Esc press for all left/right combinations and never for partial chords or repeats; safety.rs carries the NOTE about the brief's Q chord",
+    "os::windows::normalize_absolute round-trips every pixel for widths 1..=20000 under pixel = floor(n * width / 65536)",
+    "clippy -D warnings is clean for macwin-core on the host and on x86_64-pc-windows-gnu; macwin-core has no dependencies besides thiserror and tracing (+ proptest dev)"
+  ],
+  "verification": [
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo test -p macwin-core",
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo clippy -p macwin-core --all-targets -- -D warnings",
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo clippy -p macwin-core --all-targets --target x86_64-pc-windows-gnu -- -D warnings",
+    "cd /Users/kulacidmyt/Documents/macwin && RUSTUP_TOOLCHAIN=stable cargo fmt --all --check"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}
